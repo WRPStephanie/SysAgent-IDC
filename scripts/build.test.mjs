@@ -71,6 +71,11 @@ function write(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, data);
 }
+if (args[0] === 'run') {
+  for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES', 'FONT_LICENSE']) {
+    if (!fs.readFileSync(file).equals(fs.readFileSync(path.join('..', file)))) throw new Error('Legal files must be synchronized before packaging: ' + file);
+  }
+}
 if (args[0] === 'ci') {
   fs.mkdirSync('node_modules', { recursive: true });
 } else if (folder === 'sysagent-idc' && ['run build', 'run build:deb'].includes(args.join(' '))) {

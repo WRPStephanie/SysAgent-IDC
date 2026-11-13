@@ -1,6 +1,6 @@
 {
   "name": "sysagent-idc",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "private": true,
   "license": "MIT",
   "description": "SysAgent管家 - 本地 AI 工作站智能运维桌面应用",

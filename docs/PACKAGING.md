@@ -1,10 +1,10 @@
 # 打包与安装
 
-当前交付为 **SysAgent 0.2.18 / GX 0.6.5-2 / 独立 AgentSight 0.16.0**。安装者优先阅读[根 README](../README.md)。
+当前交付为 **SysAgent 0.2.19 / GX 0.6.5-2 / 独立 AgentSight 0.16.0**。安装者优先阅读[根 README](../README.md)。
 
-## 0.2.18 开源发布件
+## 0.2.19 开源发布件
 
-在项目根目录执行 `npm run build`（`npm run release` 是同一入口），已有 Node 依赖时可执行 `npm run build -- --skip-install`。入口 [scripts/build.mjs](../scripts/build.mjs) 先做统一版本检查，再准备并校验 sysAK bundle、校验 AgentSight 与 GX 输入并与主 deb 依赖交叉核对、在子项目执行 `npm ci`，然后生成 `release/build-0.2.18/` 中的主 deb、官方未修改 GX deb、AgentSight runtime deb、VSIX、`agentsight-runtime/`、安装脚本、三份许可声明与 `SHA256SUMS`。桌面步骤调用 `build:deb`，**不生成 AppImage**；入口不安装系统服务、不开启采集、不结束进程、不上传发布件。
+在项目根目录执行 `npm run build`（`npm run release` 是同一入口），已有 Node 依赖时可执行 `npm run build -- --skip-install`。入口 [scripts/build.mjs](../scripts/build.mjs) 先做统一版本检查，再准备并校验 sysAK bundle、校验 AgentSight 与 GX 输入并与主 deb 依赖交叉核对、在子项目执行 `npm ci`，然后生成 `release/build-0.2.19/` 中的主 deb、官方未修改 GX deb、AgentSight runtime deb、VSIX、`agentsight-runtime/`、安装脚本、三份许可声明与 `SHA256SUMS`。桌面步骤调用 `build:deb`，**不生成 AppImage**；入口不安装系统服务、不开启采集、不结束进程、不上传发布件。
 
 > **已知构建缺口（当前仓库状态）：** `vendor/sysak/linux-x64/` 仍是旧四命令包（manifest `commands` 为 `idc/resource_anomaly/memgraph/ai`，规则行为 `detect/generic:idc:…`），而 [prepare-sysak.cjs](../sysagent-idc/scripts/prepare-sysak.cjs) 与 deb postinst 都要求 `idc_inspect`。因此 `npm run build`、`build:desktop`、`build:ide`、桌面 `build:deb`/`build:electron`/`verify:sysak` 和 IDE 构建都会在准备 bundle 时失败，报 `prepare:sysak: Missing idc_inspect rule with python-dep{python3}`；只有 `npm run build:web` 不受影响。修复方式是用包含 `idc_inspect` 的 sysAK 构建产物替换 vendor 输入并同步 manifest 的 `commands` 与逐文件哈希，或临时以 `SYSAK_BUNDLE_DIR`／`npm --prefix sysagent-idc run prepare:sysak -- --source <产物目录>` 指向已完成的构建。缺口修复前不能声称发布包构建通过。
 
@@ -16,7 +16,9 @@
 
 安装后 GX 辅助程序验证已配置版本和可信文件，为 `/usr/lib64` 注册动态库路径并运行 `ldconfig`；不会把 GX 自带的通用 ELF/DWARF 库加入全局搜索路径。真实 GPU 诊断仍取决于硬件和驱动，版本与依赖加载验证不等于硬件功能认证。
 
-源码快照 `sysagent-source-0.2.18.tar.gz` 与离线归档 `release/SysAgent-0.2.18-linux-x64-offline.tar.gz` **不是标准构建入口的产物**，当前工作区也不包含 `release/`。需要归档交付时由维护者在构建成功后另行组包并逐文件校验；本文档不声称这些归档已生成或已校验。
+此前 0.2.19 批次单独重编译 SysAK 的原生 `ai`，使用既有 SysAK 构建镜像、Rust/Cargo 1.77.0、GCC 9.3.1，保留原 Cargo.toml/Cargo.lock，执行 `cargo build --locked --release --bin ai --lib -j2`。该批次仅更新 vendor 中 `ai` 的二进制与 manifest 哈希，其他 SysAK 输入和 AgentSight 不重新编译；官方 GX 包不修改。独立 `ai` 不依赖 coolbpf `CollectionFramework`。执行追踪确认新 `ai` 调用 `/usr/bin/gx diag`，无 GPU/驱动返回有效 JSON；不能将其当作 GPU 硬件成功路径，也不代表当前 `idc_inspect` 迁移后的完整包验收。
+
+此前批次另附 `sysagent-source-0.2.19.tar.gz` 源码快照及 `release/SysAgent-0.2.19-linux-x64-offline.tar.gz` 发布归档。它们**不是标准构建入口的产物**；当前迁移后的归档交付需在构建成功后另行组包并逐文件校验，不能沿用旧批次验收。
 
 ## 配置与源码（当前）
 

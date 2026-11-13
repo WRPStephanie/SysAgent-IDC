@@ -165,7 +165,10 @@ async function run() {
   const commands = await vscode.commands.getCommands(true);
   for (const id of ['sysagent.openHome', 'sysagent.inspect']) assert(commands.includes(id), id);
   for (const id of ['sysagent.alertDemo', 'sysagent.resetDemo']) assert(!commands.includes(id), id);
-  await waitFor(() => api.inspect().mode === 'collected' && !api.inspect().statusText.includes('spin'), 'actual collection/status');
+  await waitFor(() => api.inspect().mode === 'collected' && !api.inspect().statusText.includes('spin'), 'actual collection/status').catch((error) => {
+    console.error('Collection startup evidence:', JSON.stringify(api.inspect()));
+    throw error;
+  });
   collectorEvidence(api.inspect(), 'resources');
   assert(!api.inspect().panelOpen);
   record(`cached VS Code ${vscode.version} activates the actual extension, registers only home/inspect and displays collected status`);

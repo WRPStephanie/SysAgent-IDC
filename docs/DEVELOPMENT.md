@@ -1,6 +1,6 @@
 # 开发说明
 
-当前交付版本为 **SysAgent 0.2.18 / GX 0.6.5-2 / AgentSight 0.16.0**，构建输出目录为 `release/build-0.2.18/`（构建后生成，当前工作树未包含发布件）。在项目根目录使用 `npm run build`；**当前随附的 `vendor/sysak/linux-x64/` 仍是旧四命令包，缺少运行时要求的 `idc_inspect`，完整包构建会在 SysAK 准备步骤失败**，详见[根 README 的已知构建缺口](../README.md#3-一键构建)。安装入口见[根 README](../README.md)，当前打包边界见[打包说明](./PACKAGING.md)。下文保留早期 Demo 开发和验收工具记录；其中模拟业务、历史版本、测试数量与旧 Demo 发行命令不代表 0.2.18 的行为或验收。
+当前源码版本为 **SysAgent 0.2.19 / GX 0.6.5-2 / AgentSight 0.16.0**，构建输出目录为 `release/build-0.2.19/`。此前 0.2.19 发布批次单独重编译原生 SysAK `ai`，另附离线归档 `release/SysAgent-0.2.19-linux-x64-offline.tar.gz`，不代表迁移后的发布验证。在项目根目录使用 `npm run build`；**当前随附的 `vendor/sysak/linux-x64/` 仍是旧四命令包，缺少运行时要求的 `idc_inspect`，完整包构建会在 SysAK 准备步骤失败**，详见[根 README 的已知构建缺口](../README.md#3-一键构建)。安装入口见[根 README](../README.md)，当前打包边界见[打包说明](./PACKAGING.md)。下文保留早期 Demo 开发和验收工具记录；其中模拟业务、历史版本、测试数量与旧 Demo 发行命令不代表 0.2.19 的行为或验收。
 
 ## 环境
 

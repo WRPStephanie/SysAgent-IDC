@@ -10,7 +10,7 @@ SysAgent 是面向 Linux 工作站的本地资源与 Agent 诊断工具，提供
 
 系统资源诊断由**当前用户直接调用系统已安装的 sysAK `idc_inspect`**（采集 schema 1.1），再经本机回环 OpenAPI 解析为展示数据；Agent 诊断使用独立的 AgentSight 运行时。主 deb 安装的 `sysom-idc.service` 只用于 AgentSight 主机级采集控制，不再是资源采集的前提。服务不可用或证据缺失时会明确提示，不把空数据当作健康结论。部分非核心页面仍含演示内容，详见[功能指南](./docs/FUNCTION-USER-GUIDE.md)。
 
-当前版本：**SysAgent 0.2.18 / AgentSight 0.16.0**。
+当前版本：**SysAgent 0.2.19 / AgentSight 0.16.0**。
 
 - [快速开始](#快速开始)
 - [安装与首次运行](#安装与首次运行)
@@ -70,11 +70,11 @@ npm run build
 产物目录结构：
 
 ```text
-release/build-0.2.18/
-├── sysagent-idc_0.2.18_amd64.deb
+release/build-0.2.19/
+├── sysagent-idc_0.2.19_amd64.deb
 ├── gx_0.6.5-2_amd64.deb
 ├── sysom-agentsight-runtime_0.16.0_amd64.deb
-├── sysagent-ide-0.2.18.vsix
+├── sysagent-ide-0.2.19.vsix
 ├── agentsight-runtime/
 ├── install-debs.sh
 ├── SHA256SUMS
@@ -93,6 +93,8 @@ release/build-0.2.18/
 | `install-debs.sh` / `SHA256SUMS` | 同批次安装入口与完整性校验 |
 
 `npm run release` 使用同一入口。构建只编译和打包，**不安装系统服务、不开启真实采集、不结束进程、不上传云端或发布件**。此入口使用随仓库提供的 SysAK/AgentSight 二进制及官方未修改的 GX deb，不进行 SysAK、AgentSight、GX 或完整上游 coolbpf 的重新编译，也不生成 AppImage。
+
+0.2.19 批次的 SysAK `ai` 输入已从原生 Rust 源码单独重新编译，并通过执行追踪确认调用官方 GX 0.6.5-2；SysAK 启动器、其他诊断工具及 AgentSight 沿用已校验输入。独立 `ai` 不依赖 coolbpf 的 `CollectionFramework`，不能把后者的版本补丁当作 `ai` 的编译内容。当前机器没有计算 GPU，只验证无 GPU/驱动分支，不代表 GPU 硬件诊断认证。
 
 只需要部分产物时：
 
@@ -117,7 +119,7 @@ Electron 下载默认使用项目内置镜像，可用 `ELECTRON_MIRROR`、`ELEC
 从项目根目录进入本次构建目录：
 
 ```bash
-cd release/build-0.2.18
+cd release/build-0.2.19
 sha256sum --check SHA256SUMS
 ```
 
@@ -144,12 +146,12 @@ GX 原生组件实际需要 glibc 2.27+、`zlib1g` 和 `libzstd1`；主 SysAgent
 
 ### 3. 安装 IDE 插件（可选）
 
-推荐先安装三个 deb，再在 IDE 命令面板选择 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**，选择 `sysagent-ide-0.2.18.vsix`，按提示重载 IDE。
+推荐先安装三个 deb，再在 IDE 命令面板选择 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**，选择 `sysagent-ide-0.2.19.vsix`，按提示重载 IDE。
 
 VS Code 用户也可在产物目录执行：
 
 ```bash
-code --install-extension ./sysagent-ide-0.2.18.vsix
+code --install-extension ./sysagent-ide-0.2.19.vsix
 ```
 
 点击状态栏 SysAgent 入口，或执行 **SysAgent管家: 打开体检主页**。无需同时运行桌面应用。插件诊断本地扩展宿主所在机器，不自动诊断远程工作区；相同 HOME/XDG 环境下，两端共享 AgentSight 用户目录，但巡检设置各自保存。
@@ -158,7 +160,7 @@ code --install-extension ./sysagent-ide-0.2.18.vsix
 
 ```bash
 sudo dpkg --install ./sysom-agentsight-runtime_0.16.0_amd64.deb
-code --install-extension ./sysagent-ide-0.2.18.vsix
+code --install-extension ./sysagent-ide-0.2.19.vsix
 ```
 
 此方式不安装主 deb 的辅助服务，因此没有 AgentSight 主机级采集控制；VSIX 本身不会安装系统服务。IDE 的资源采集仍取决于扩展宿主机器上是否已安装含 `idc_inspect` 的系统 sysAK。
@@ -273,7 +275,7 @@ npm --prefix sysagent-idc test        # 应用全量：采集/上传/控制器/U
 
 应用全量测试有两个已知环境性问题：`health-score.test.cjs` 依赖未随仓库提供的历史对照夹具（`sysagent-analysis/port/c4-health-data.js`），会 ENOENT 失败；`sysak-package.test.cjs` 的 15 秒 `spawnSync` 上限在全量并发下偶发超时，单独运行可通过。两者都不代表采集或上传链路失败。
 
-此前在 Linux x64、Node.js 22.23.1 / npm 10.9.8 上记录过 49 项构建测试和 37 项查询/API 测试通过；该历史记录不等于 0.2.18 的完整构建验收。当前完整构建目标为三个 deb 与 VSIX，使用预编译输入，不是完整上游源码重编译；且受上文 SysAK 输入缺口影响，完整包构建尚未在缺口修复后重跑。
+此前在 Linux x64、Node.js 22.23.1 / npm 10.9.8 上记录过 49 项构建测试和 37 项查询/API 测试通过；该历史记录不等于 0.2.19 的完整构建验收。当前完整构建目标为三个 deb 与 VSIX，使用预编译输入，不是完整上游源码重编译；且受上文 SysAK 输入缺口影响，完整包构建尚未在缺口修复后重跑。
 
 历史验证不包含安装、图形界面或真实采集验收，也不证明依赖硬件与驱动的 GX GPU 跟踪可用。部分历史模块测试依赖未纳入仓库的参考夹具，不属于根目录测试范围；历史 Demo 发行脚本不是当前构建入口。
 

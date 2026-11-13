@@ -1,6 +1,6 @@
 {
   "name": "sysagent-releases",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "private": true,
   "license": "MIT",
   "description": "SysAgent 所有本地发行版的统一版本和构建入口",

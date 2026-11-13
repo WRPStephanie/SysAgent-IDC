@@ -101,6 +101,9 @@ Linux x64、Node.js 20+，原生构建输入已随源码提供。
     if (!desktop) install.push('--ignore-scripts');
     for (const folder of folders) npm(folder, install);
   }
+  for (const folder of folders) {
+    for (const file of legalFiles) copyFileSync(resolve(root, file), resolve(root, folder, file));
+  }
   npm('sysagent-idc', ['run', desktop ? 'build:deb' : 'build']);
   for (const file of legalFiles) copyFileSync(resolve(root, file), resolve(root, 'sysagent-idc/dist', file));
   if (ide) npm('sysagent-ide-extension', ['run', 'package']);

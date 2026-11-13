@@ -9,7 +9,7 @@ license identifiers are recorded in the package-lock.json files; inspect the
 actual dependency distributions and preserve their notices when redistributing
 a build. This file covers React, React DOM, Lucide, the bundled Noto Sans SC
 fonts and the native components discussed below, not every possible build-tool
-or native dependency. Current release: SysAgent 0.2.18; AgentSight 0.16.0
+or native dependency. Current release: SysAgent 0.2.19; AgentSight 0.16.0
 (unchanged).
 
 The source export excludes reference demo HTML, extracted reference bundles,
@@ -25,6 +25,16 @@ The maintainer's binary redistribution authorization, including the user's
 explicit authorization for public GX redistribution, does not replace upstream
 copyrights, licenses or notices and is not a new upstream license grant.
 The project MIT license does not relicense those native components.
+
+For 0.2.19, only the standalone SysAK AI executable was rebuilt from unchanged
+Rust sources using the supplied SysAK builder image, Rust/Cargo 1.77.0 and
+GCC 9.3.1, with the original Cargo.toml and Cargo.lock. Its SHA-256 is
+9fd0165f597eed4f0d918ad893708dd148ffc314164e1b3c36153b1e79feaad2.
+The launcher, other SysAK tools and AgentSight remain unchanged inputs.
+Standalone AI does not depend on coolbpf CollectionFramework; rebuilding AI
+does not incorporate that separate framework's GX patch. Native execution
+tracing confirmed the rebuilt AI invokes the unchanged official GX executable.
+The tested branch has no compute GPU and is not hardware diagnosis certification.
 
 Retained UI, data and styles include material ported from a reference demo.
 The permission record for that reference and its derivatives has not been

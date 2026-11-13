@@ -6,7 +6,10 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const rootUnavailableOnly = process.env.SYSOM_ROOT_UNAVAILABLE_ONLY === '1';
-const puppeteer = require(require.resolve('puppeteer-core', { paths: [path.resolve(__dirname, '../../sysagent-analysis')] }));
+const isolatedNative = process.env.SYSOM_NATIVE_GX_E2E === '1';
+const puppeteer = require(require.resolve('puppeteer-core', { paths: [
+  process.env.SYSOM_PUPPETEER_ROOT ? path.resolve(process.env.SYSOM_PUPPETEER_ROOT) : path.resolve(__dirname, '../../sysagent-analysis'),
+] }));
 
 const root = path.resolve(__dirname, '..');
 const extensionPath = process.env.SYSOM_EXTENSION_PATH ? path.resolve(process.env.SYSOM_EXTENSION_PATH) : root;
@@ -31,9 +34,10 @@ function verifyManifest() {
   fs.accessSync(path.join(bundle, 'sysak'), fs.constants.X_OK);
   return { files: Object.keys(manifest.files).length, commands: manifest.commands };
 }
-const bundleManifest = rootUnavailableOnly ? verifyManifest() : undefined;
+const bundleManifest = rootUnavailableOnly || isolatedNative ? verifyManifest() : undefined;
 const cache = path.join(root, '.vscode-test');
-const vscodeExecutablePath = path.join(cache, 'vscode-linux-x64-1.145.2', 'code');
+const vscodeExecutablePath = process.env.SYSOM_VSCODE_PATH
+  ? path.resolve(process.env.SYSOM_VSCODE_PATH) : path.join(cache, 'vscode-linux-x64-1.145.2', 'code');
 fs.accessSync(vscodeExecutablePath, fs.constants.X_OK);
 let stopping = false;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -411,9 +415,22 @@ async function inspectWebview(signals, outputDir, port, owned, identity) {
     assert.equal(inspectionStatus.last_task.operation, 'inspect');
     assert.equal(inspectionStatus.last_task.profile, 'inspection');
     assert.equal(inspectionStatus.last_task.simulated, false);
+    if (isolatedNative) {
+      const manifest = JSON.parse(fs.readFileSync(path.join(extensionPath, 'dist/sysak/manifest.json'), 'utf8'));
+      assert.equal(manifest.files['.sysak_components/tools/ai'], process.env.SYSOM_NATIVE_AI_SHA256);
+      assert.equal(inspectionState.resources.gpu.status, 'unavailable');
+      assert.equal(inspectionState.resources.gpu.rows.length, 0);
+      assert.equal(inspectionState.gpuDiagnostic.status, 'unavailable');
+      assert.equal(inspectionState.gpuDiagnostic.outcome, 'unknown');
+      assert.equal(inspectionState.gpuDiagnostic.complete, false);
+      assert.equal(inspectionState.gpuDiagnostic.gpuCount, null);
+      assert.equal(inspectionState.gpuDiagnostic.jobAnalysis.complete, false);
+      assert.match(inspectionState.gpuDiagnostic.summary, /不能判断整体正常/);
+      result.nativeGpu = { aiSha256: process.env.SYSOM_NATIVE_AI_SHA256, manifest: bundleManifest, hasGpu: inspectionState.hasGpu, diagnostic: inspectionState.gpuDiagnostic };
+    }
     const diagnostics = ['root', 'memory', 'fd'].map((id) => inspectionState.inspections.find((item) => item.id === id));
     for (const item of diagnostics) {
-      assert(item && item.evidence.some((entry) => entry.includes('sysAK')));
+      assert(item && item.evidence.some((entry) => /sysak/i.test(entry)));
       assert.equal(item.status, item.usage === null ? 'unchecked' : item.usage > 90 ? 'abnormal' : 'normal');
       if (item.id === 'fd') {
         if (!item.execution || item.execution === 'unavailable' || (item.execution === 'partial' && item.status !== 'abnormal')) {
@@ -428,6 +445,16 @@ async function inspectWebview(signals, outputDir, port, owned, identity) {
     await frame.waitForSelector('dialog[open] [data-inspection="fd"]');
     const fdResult = await frame.$eval('[data-inspection="fd"]', (item) => item.querySelector('.sh-inspection-result').textContent);
     if (diagnostics[2].status === 'unchecked') assert(!fdResult.includes('正常'));
+    if (isolatedNative) {
+      const gpuDom = await frame.$eval('dialog[open] [data-inspection="gpu"]', (item) => {
+        item.scrollIntoView({ block: 'center' });
+        return { result: item.querySelector('.sh-inspection-result').textContent.trim(), text: item.textContent };
+      });
+      assert.notEqual(gpuDom.result, '正常');
+      assert.match(gpuDom.text, /GPU 诊断不可用/);
+      result.nativeGpu.dom = gpuDom;
+      await workbench.screenshot({ path: path.join(outputDir, 'ide-vscode-native-inspection.png') });
+    }
     await frame.evaluate(() => document.querySelector('dialog[open]').dispatchEvent(new Event('cancel', { cancelable: true })));
     await frame.waitForFunction(() => !document.querySelector('dialog[open]'));
     assert.equal(errors.size, 0, [...errors].join('\n'));
@@ -458,7 +485,8 @@ async function inspectWebview(signals, outputDir, port, owned, identity) {
   const userData = path.join(runDir, 'user-data');
   const extensions = path.join(runDir, 'extensions');
   for (const directory of [signals, userData, extensions]) fs.mkdirSync(directory);
-  const outputBase = path.resolve(root, '../sysagent-analysis/tests/output');
+  const outputBase = process.env.SYSOM_EVIDENCE_DIR
+    ? path.resolve(process.env.SYSOM_EVIDENCE_DIR) : path.resolve(root, '../sysagent-analysis/tests/output');
   fs.mkdirSync(outputBase, { recursive: true });
   const outputDir = fs.mkdtempSync(path.join(outputBase, rootUnavailableOnly ? `ide-vscode-v${version}-root-unavailable-` : 'ide-vscode-real-'));
   const port = await reservePort();
@@ -485,7 +513,7 @@ async function inspectWebview(signals, outputDir, port, owned, identity) {
     `--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1',
     `--extensionDevelopmentPath=${extensionPath}`, `--extensionTestsPath=${path.join(__dirname, 'vscode-suite.cjs')}`,
     '--disable-extensions', '--disable-workspace-trust', '--skip-welcome', '--skip-release-notes',
-    ...(rootUnavailableOnly ? ['--disable-updates', '--disable-telemetry', '--disable-background-networking', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1'] : []),
+    ...(rootUnavailableOnly || isolatedNative ? ['--disable-updates', '--disable-telemetry', '--disable-background-networking', '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1'] : []),
   ], { shell: false, stdio: rootUnavailableOnly ? ['ignore', logFd, logFd] : 'inherit', env: { ...process.env, SYSOM_SIGNALS: signals, SYSOM_EXPECTED_VERSION: version, SYSOM_EXTENSION_PATH: extensionPath } });
   let closed = false;
   const exited = new Promise((resolve) => child.once('close', (code, signal) => { closed = true; resolve({ code, signal }); }));
