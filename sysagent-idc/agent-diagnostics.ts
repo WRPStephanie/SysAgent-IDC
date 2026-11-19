@@ -1,8 +1,11 @@
 import {
-  type AgentDiagnostic, type AgentSourceKey, type AgentSourceStatus,
+  type AgentDiagnostic, type AgentStoredHistory, type AgentSourceKey, type AgentSourceStatus,
   type AgentProcessEvidence, type AgentSessionEvidence, type AgentInterruptionEvidence,
   type AgentLatencyEvidence, agentSourceLabels, agentInterruptionLabels,
 } from './src/agent-diagnostics-data';
+
+import { parseHookReport } from './agent-hook-diagnostics';
+export { AGENT_HOOK_LIMITS } from './agent-hook-diagnostics';
 
 // Pure, bounded evidence interpretation. No collector, network, LLM or process actions.
 export const AGENT_SOURCE_LIMITS = { processes: 256, sessions: 500, interruptions: 200, interruptionCounts: 1, latency: 256 } as const;
@@ -147,8 +150,58 @@ const SUGGESTIONS: Record<string, string> = {
   user_cancel: '人工确认是否为预期取消；取消事件不等于 Agent 故障。',
 };
 
+const HISTORY_KEYS = ['usage', 'sessions', 'interruptionCounts'] as const;
+function storedHistory(raw: unknown, sampledAt: string): AgentStoredHistory {
+  const report: AgentStoredHistory = {
+    scope: 'all_stored', sampledAt, status: 'unavailable', coverage: [],
+    totals: { sessions: null, calls: null, inputTokens: null, outputTokens: null, unresolved: null, critical: null, high: null },
+  };
+  const valid = shape(raw, ['scope', 'sampled_at', 'sources']) && raw.scope === 'all_stored' && timestamp(raw.sampled_at) &&
+    Date.parse(raw.sampled_at) <= Date.parse(sampledAt) && object(raw.sources) &&
+    Object.keys(raw.sources).every(key => HISTORY_KEYS.includes(key as typeof HISTORY_KEYS[number]));
+  if (valid) report.sampledAt = raw.sampled_at as string;
+  let usable = 0;
+  for (const key of HISTORY_KEYS) {
+    const source = valid ? (raw.sources as Obj)[key] : null;
+    let status: AgentSourceStatus = 'invalid';
+    let reason = '历史来源结构、时间或数据无效；累计值未知。';
+    if (source === undefined) { status = 'unavailable'; reason = '未采集此历史来源；累计值未知。'; }
+    else if (shape(source, ['status', 'reason', 'data']) && STATUSES.includes(source.status as AgentSourceStatus) && text(source.reason, 512, true)) {
+      status = source.status as AgentSourceStatus;
+      reason = safeText(source.reason);
+      if (status === 'unavailable' || status === 'invalid') {
+        if (source.data !== null) { status = 'invalid'; reason = '不可用历史来源携带数据，已拒绝解释。'; }
+      } else {
+        const data = source.data;
+        const parsed = key === 'usage' ? shape(data, ['calls', 'inputTokens', 'outputTokens']) &&
+          integer(data.calls) && integer(data.inputTokens) && integer(data.outputTokens) ? data : null :
+          key === 'sessions' ? shape(data, ['total']) && integer(data.total) ? data : null : counts(data);
+        if (parsed === null) { status = 'invalid'; reason = '历史汇总字段或安全整数无效，已拒绝解释整个来源。'; }
+        else if (status === 'available') {
+          usable++;
+          if (key === 'usage') {
+            report.totals.calls = (parsed as Obj).calls as number;
+            report.totals.inputTokens = (parsed as Obj).inputTokens as number;
+            report.totals.outputTokens = (parsed as Obj).outputTokens as number;
+          } else if (key === 'sessions') report.totals.sessions = (parsed as Obj).total as number;
+          else {
+            report.totals.unresolved = (parsed as Counts).total;
+            report.totals.critical = (parsed as Counts).critical;
+            report.totals.high = (parsed as Counts).high;
+          }
+        }
+        if (status === 'truncated') reason = `${reason ? `${reason}；` : ''}历史来源未完整采集；累计值未知。`;
+      }
+    }
+    report.coverage.push({ key, status, reason: reason.slice(0, 512) });
+  }
+  report.status = report.coverage.every(source => source.status === 'available') ? 'ok' : usable ? 'partial' : 'unavailable';
+  return report;
+}
+
 export function parseAgentDiagnostic(raw: unknown): AgentDiagnostic {
-  if (!shape(raw, ['schema_version', 'source', 'sampled_at', 'window', 'sources']) || raw.schema_version !== '1.0' || raw.source !== 'agentsight' ||
+  if (!object(raw) || !['schema_version', 'source', 'sampled_at', 'window', 'sources'].every(key => Object.hasOwn(raw, key)) ||
+      Object.keys(raw).some(key => !['schema_version', 'source', 'sampled_at', 'window', 'sources', 'hooks', 'history'].includes(key)) || raw.schema_version !== '1.0' || raw.source !== 'agentsight' ||
       !timestamp(raw.sampled_at) || !shape(raw.window, ['start', 'end']) || !timestamp(raw.window.start) || !timestamp(raw.window.end) ||
       Date.parse(raw.window.start) > Date.parse(raw.window.end) || Date.parse(raw.window.end) > Date.parse(raw.sampled_at) ||
       !object(raw.sources) || Object.keys(raw.sources).some(key => !SOURCE_KEYS.includes(key as AgentSourceKey))) {
@@ -160,7 +213,9 @@ export function parseAgentDiagnostic(raw: unknown): AgentDiagnostic {
     lastScanAt: null, filteredProcesses: null, coverage: [],
     totals: { sessions: null, inputTokens: null, outputTokens: null, unresolved: null, critical: null, high: null },
     findings: [], processes: [], sessions: [], interruptions: [], latency: [],
+    hooks: parseHookReport(raw.hooks, { start: raw.window.start, end: raw.window.end }),
   };
+  if (Object.hasOwn(raw, 'history')) report.history = storedHistory(raw.history, raw.sampled_at);
   const windowStart = Date.parse(raw.window.start);
   const windowEnd = Date.parse(raw.window.end);
   const sessionInWindow = (value: unknown): AgentSessionEvidence | null => {
@@ -269,12 +324,26 @@ export function parseAgentDiagnostic(raw: unknown): AgentDiagnostic {
       suggestion: '按严重程度人工核对；本服务不调用 resolve，也不确认故障根因。',
     });
   }
+  if (report.hooks.status === 'invalid' || report.hooks.status === 'truncated') report.findings.push({
+    severity: 'info', title: 'Hook 元数据覆盖不足', detail: report.hooks.reason,
+    suggestion: '仅依据有界元数据核对，未取得事件不能解释为 Agent 正常。',
+  });
+  for (const agent of report.hooks.agents) {
+    if (agent.turnFailures) {
+      abnormal = true;
+      report.findings.push({ severity: 'error', title: `${agent.agent} 轮次失败事件`, detail: `窗口内记录 ${agent.turnFailures} 次轮次失败；仅为 Hook 报告的结束状态，原因未知。`, suggestion: '人工核对对应会话；本诊断不读取对话正文或自动重试。' });
+    }
+    if (agent.toolFailures || agent.interrupts) report.findings.push({ severity: 'info', title: `${agent.agent} 工具失败或取消记录`, detail: `失败 ${agent.toolFailures} 次、明确取消 ${agent.interrupts} 次；工具失败不等于 Agent 故障，缺失取消标记不证明非用户取消。`, suggestion: '人工确认是否为预期工具错误或取消。' });
+    if (agent.permissionDenied) report.findings.push({ severity: 'info', title: `${agent.agent} 授权拒绝记录`, detail: `窗口内 ${agent.permissionDenied} 次；拒绝可为预期安全决策，不判定故障。`, suggestion: '人工核对授权意图，不自动放行或更改权限。' });
+    if (agent.openTools) report.findings.push({ severity: 'info', title: `${agent.agent} 未配对工具开始`, detail: `窗口内 ${agent.openTools} 个具有会话和调用 ID 的开始记录未配对完成或失败；可能仍在运行、窗口受限或异步乱序，不据此判定卡死。`, suggestion: '核对插件启用状态及对应会话，勿仅据此结束进程。' });
+  }
   const observed = report.processes.length > 0 || report.sessions.length > 0 || report.interruptions.length > 0 || report.latency.some(row => row.calls > 0);
   report.outcome = abnormal ? 'abnormal' : report.status === 'ok' && freshScan && observed && report.processes.every(row => row.status !== 'unknown') ? 'observed' : 'unknown';
-  report.summary = `仅分析 AgentSight 只读证据；窗口 ${localTime(report.window.start)} 至 ${localTime(report.window.end)}，采样 ${localTime(report.sampledAt)}。` +
+  report.summary = `分析 AgentSight 只读证据及独立 Hook 元数据；窗口 ${localTime(report.window.start)} 至 ${localTime(report.window.end)}，采样 ${localTime(report.sampledAt)}。` +
     `已采集会话 ${report.sessions.length}（会话及 Token 合计仅针对有效完整的已采集列表，不是会话终身累计；包含辅助调用，输入包含缓存用量；未报告 usage 的调用可能以零记录），` +
     `中断明细 ${report.interruptions.length}（上游仅未解决、最多 200 行；全窗口未处理总数${report.totals.unresolved === null ? '未知' : ` ${report.totals.unresolved}`}）。` +
     `延迟仅描述完整调用，null 表示无测量。覆盖 ${report.status}，结论 ${report.outcome}；` +
+    `Hook 来源 ${report.hooks.status}，已记录 ${report.hooks.agents.reduce((sum, agent) => sum + agent.events, 0)} 条，展示最新 ${report.hooks.events.length} 条；仅生命周期元数据，不含提示词、工具输入输出、错误正文或 Token 用量，不与 AgentSight 会话或进程身份合并。` +
     'healthy 仅表示 HTTP 任意状态响应，不保证业务正常；no_port 可为正常 CLI，offline 无崩溃标记不认定崩溃。提交成功不意味着 Agent 健康，未确认故障根因。';
   return report;
 }

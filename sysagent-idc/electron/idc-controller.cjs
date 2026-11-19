@@ -5,6 +5,7 @@ const { spawn } = require('node:child_process');
 const { runProcessAction } = require('./process-control.cjs');
 const { collectAgentEvidence, createAgentSightService, controlAgentCollection } = require('./agentsight-client.cjs');
 const { loadSysomConfig, sysakChildEnv, createSysomClient } = require('./sysom-client.cjs');
+const { collectHookEvidence, prepareHookHistory } = require('./agent-hooks.cjs');
 
 const MAX_RAW_BYTES = 8 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -203,6 +204,12 @@ function validState(state) {
         (resource.usage === null || (nonnegative(resource.usage) && resource.usage <= 100)) &&
         (resource.quantity === undefined || quantity(resource.quantity, ['B', 'W'])) &&
         (resource.gpuDevices === undefined || Array.isArray(resource.gpuDevices) && resource.gpuDevices.length <= 32 && resource.gpuDevices.every(gpuDevice)) &&
+        (resource.power === undefined || resource.power && ['measured', 'estimated', 'mixed', 'unavailable'].includes(resource.power.method) &&
+          ['cpuWatts', 'gpuWatts', 'unattributedCpuWatts'].every(key => resource.power[key] === null || nonnegative(resource.power[key])) &&
+          Array.isArray(resource.power.missing) && resource.power.missing.every(key => ['cpu', 'gpu'].includes(key)) &&
+          Array.isArray(resource.power.processes) && resource.power.processes.length <= 40 && resource.power.processes.every(row =>
+            row && typeof row.id === 'string' && typeof row.name === 'string' && nonnegative(row.usage) && quantity(row.quantity, ['W']) &&
+            Number.isSafeInteger(row.pid) && row.pid > 1 && Number.isSafeInteger(row.starttime) && row.starttime >= 0)) &&
         Array.isArray(resource.rows) && resource.rows.every((row) => nonnegative(row.usage) &&
           (row.quantity === undefined || quantity(row.quantity, ['B', 'B/s', 'W', 'count'])));
     });
@@ -414,8 +421,8 @@ async function createIdcController(options) {
     ];
     const identities = new Map(observed.filter(p => p && Number.isSafeInteger(p.pid) && p.pid > 1 && Number.isSafeInteger(p.starttime) && p.starttime >= 0)
       .map(p => [`process-${p.pid}-${p.starttime}`, { pid: p.pid, starttime: p.starttime }]));
-    const rows = ['cpu', 'memory', 'disk'].flatMap(id => state.resources[id].rows);
-    for (const item of Object.values(state.resources).flatMap(resource => resource.rows)) {
+    const rows = [...['cpu', 'memory', 'disk'].flatMap(id => state.resources[id].rows), ...(state.resources.energy.power?.processes || [])];
+    for (const item of [...Object.values(state.resources).flatMap(resource => resource.rows), ...(state.resources.energy.power?.processes || [])]) {
       item.cleanable = false;
       item.defaultSelected = false;
       item.effect = '非进程对象或身份无法核验';
@@ -526,6 +533,10 @@ async function createIdcController(options) {
           const serviceStatus = await agentService?.ensure();
           if (signal.aborted) throw new CollectorError('COLLECTION_CANCELLED', 'Agent 诊断已停止');
           const raw = await collectAgentEvidence({ ...options.agentSight, ...(agentService ? { baseUrl: agentService.endpoint() } : {}), signal, now: scheduler.now() });
+          const hookHistoryError = await prepareHookHistory({ directory: options.agentHooks?.directory, signal });
+          if (signal.aborted) throw new CollectorError('COLLECTION_CANCELLED', 'Agent 诊断已停止');
+          raw.hooks = collectHookEvidence({ directory: options.agentHooks?.directory, window: raw.window });
+          if (hookHistoryError) raw.hooks.history = hookHistoryError;
           if (serviceStatus?.state === 'unavailable') {
             for (const source of Object.values(raw.sources)) {
               if (source.status === 'unavailable') source.reason = serviceStatus.message;
@@ -554,7 +565,11 @@ async function createIdcController(options) {
                 report?.source !== 'agentsight' || report.analyzer !== 'sysom-openapi' || typeof report.sampledAt !== 'string' ||
                 typeof report.summary !== 'string' || !['ok', 'partial', 'unavailable'].includes(report.status) ||
                 !['observed', 'abnormal', 'unknown'].includes(report.outcome) || !report.window || !report.totals ||
-                !['processes', 'sessions', 'interruptions', 'latency', 'coverage', 'findings'].every(key => Array.isArray(report[key]))) {
+                !['processes', 'sessions', 'interruptions', 'latency', 'coverage', 'findings'].every(key => Array.isArray(report[key])) ||
+                !report.hooks || !['available', 'unavailable', 'invalid', 'truncated'].includes(report.hooks.status) ||
+                typeof report.hooks.reason !== 'string' || !Array.isArray(report.hooks.agents) || report.hooks.agents.length > 16 ||
+                !Array.isArray(report.hooks.events) || report.hooks.events.length > 200 ||
+                report.hooks.skippedLines !== null && (!Number.isSafeInteger(report.hooks.skippedLines) || report.hooks.skippedLines < 0)) {
               throw new CollectorError('INVALID_API_RESPONSE', 'OpenAPI 返回了不兼容的 Agent 诊断数据', 502);
             }
             if (signal.aborted || !enabled || closed) throw new CollectorError('COLLECTION_CANCELLED', 'Agent 诊断已停止');
@@ -591,12 +606,13 @@ async function createIdcController(options) {
       return enqueue(async () => {
         requireProcessControl();
         if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).some(key => !['resource', 'ids', 'revision'].includes(key)) ||
-            !['cpu', 'memory', 'disk'].includes(payload.resource) || !Array.isArray(payload.ids) || !payload.ids.length || payload.ids.length > 10 ||
+            !['cpu', 'energy', 'memory', 'disk'].includes(payload.resource) || !Array.isArray(payload.ids) || !payload.ids.length || payload.ids.length > 10 ||
             !payload.ids.every(id => typeof id === 'string') || new Set(payload.ids).size !== payload.ids.length || !Number.isInteger(payload.revision)) {
           throw new CollectorError('INVALID_PARAMETERS', '请选择 1–10 个有效进程', 400);
         }
         if (payload.revision !== cached.revision) throw new CollectorError('STALE_SNAPSHOT', '资源已更新，请重新选择进程', 409);
-        const rows = payload.ids.map(id => cached.resources[payload.resource].rows.find(row => row.id === id && row.cleanable && processTargets.has(id)));
+        const candidates = payload.resource === 'energy' ? cached.resources.energy.power?.processes || [] : cached.resources[payload.resource].rows;
+        const rows = payload.ids.map(id => candidates.find(row => row.id === id && row.cleanable && processTargets.has(id)));
         if (rows.some(row => !row)) throw new CollectorError('PROTECTED_PROCESS', '对象已失效或不允许结束，请刷新后重选', 409);
         cleanupPlan = null;
         const targets = rows.map(row => processTargets.get(row.id));
@@ -620,7 +636,7 @@ async function createIdcController(options) {
         if (!plan || plan.token !== payload.token) throw new CollectorError('INVALID_CLEANUP_PLAN', '确认已失效或已使用，请重新选择', 409);
         cleanupPlan = null;
         if (scheduler.now() >= plan.expires || plan.revision !== cached.revision) throw new CollectorError('EXPIRED_CLEANUP_PLAN', '确认已过期或快照已更新，请重新选择', 409);
-        for (const resource of Object.values(cached.resources)) for (const row of resource.rows) if (plan.processes.some(item => item.id === row.id)) row.cleanable = false;
+        for (const row of [...Object.values(cached.resources).flatMap(resource => resource.rows), ...(cached.resources.energy.power?.processes || [])]) if (plan.processes.some(item => item.id === row.id)) row.cleanable = false;
         let results;
         try { results = await processAction('terminate', plan.targets); }
         catch { throw new CollectorError('PROCESS_RESULT_UNKNOWN', '操作结果未完整返回，请刷新核对，不要重复结束进程', 503); }

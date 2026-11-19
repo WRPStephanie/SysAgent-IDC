@@ -25,7 +25,7 @@ const resourceSession = object({ id: string, name: string, status: enumeration('
 const rowProperties = {
   id: string, name: string, detail: string, usage: number, cleanable: boolean, defaultSelected: boolean,
   effect: string, quantity: rowQuantity, pid: integer, starttime: integer, agentKind: string, agentId: string,
-  sessions: array(resourceSession),
+  sessions: array(resourceSession), powerSource: enumeration('rapl', 'gpu-sensor', 'cpu-model', 'gpu-model'), referenceWatts: number,
 };
 const rowSchema = object(rowProperties);
 const deviceProperties = {
@@ -52,6 +52,7 @@ const resourceProperties = {
   status: enumeration('available', 'partial', 'unavailable'), note: string, quantity,
   rankLabel: string, rankUnit: enumeration('%', 'B', 'B/s', 'W', 'count'), sampledAt: date,
   gpuDevices: array(deviceSchema), rows: array(rowSchema),
+  power: object({ method: enumeration('measured', 'estimated', 'mixed', 'unavailable'), cpuWatts: nullable(number), gpuWatts: nullable(number), missing: array(enumeration('cpu', 'gpu')), processes: array(rowSchema), unattributedCpuWatts: nullable(number) }, ['method', 'cpuWatts', 'gpuWatts', 'missing', 'processes', 'unattributedCpuWatts']),
 };
 const inspectionProperties = { id: string, label: string, important: boolean, phase: { type: 'integer', enum: [1, 2] }, status: enumeration('normal', 'abnormal', 'unchecked'), usage: nullable(number), detail: string, evidence: array(string), execution: enumeration('complete', 'partial', 'unavailable') };
 const optimizationProperties = { id: string, inspection: string, title: string, action: string, effect: string };
@@ -61,7 +62,44 @@ const sessionProperties = { id: string, agent: nullable(string), model: nullable
 const interruptionProperties = { id: string, sessionId: nullable(string), callId: nullable(string), pid: nullable(integer), agent: nullable(string), type: string, severity: enumeration('critical', 'high', 'medium', 'low'), occurredAt: nullable(date), resolved: boolean };
 const latencyProperties = { agent: nullable(string), calls: integer, streamingCalls: integer, ttftP95Ms: nullable(number), e2eP95Ms: nullable(number), tpsP50: nullable(number), tpotP95Ms: nullable(number) };
 const agentFindingProperties = { severity: enumeration('info', 'warning', 'error'), title: string, detail: string, suggestion: string };
-const coverageProperties = { key: enumeration('processes', 'sessions', 'interruptions', 'interruptionCounts', 'latency'), status: enumeration('available', 'unavailable', 'invalid', 'truncated'), reason: string };
+const agentSourceStatus = enumeration('available', 'unavailable', 'invalid', 'truncated');
+const coverageProperties = { key: enumeration('processes', 'sessions', 'interruptions', 'interruptionCounts', 'latency'), status: agentSourceStatus, reason: string };
+const hookDate = { ...date, pattern: '^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}Z$' };
+const hookAgent = { type: 'string', pattern: '^[a-z][a-z0-9-]{0,31}$', minLength: 1, maxLength: 32 };
+const hookIdentifier = { type: ['string', 'null'], pattern: '^[A-Za-z0-9._:@/+\\-]{1,128}$', minLength: 1, maxLength: 128 };
+const hookLabel = { ...hookIdentifier, pattern: '^[A-Za-z0-9._:@/+ \\-]{1,128}$' };
+const hookCount = { type: 'integer', minimum: 0, maximum: 5000 };
+const hookAggregateCount = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+const hookKind = enumeration('session_start', 'session_end', 'prompt_submit', 'tool_start', 'tool_end', 'tool_failure', 'permission_request', 'permission_denied', 'turn_stop', 'turn_failure', 'notification', 'subagent_start', 'subagent_stop', 'task_created', 'task_completed', 'teammate_idle', 'elicitation', 'elicitation_result', 'compact', 'compact_completed');
+const hookEventProperties = {
+  id: { type: 'string', pattern: '^[a-f0-9]{16}$', minLength: 16, maxLength: 16 }, agent: hookAgent,
+  kind: hookKind, occurredAt: hookDate, sessionId: hookIdentifier, tool: hookIdentifier, callId: hookIdentifier,
+  errorType: hookIdentifier, interrupt: nullable(boolean), subagent: hookLabel, model: hookLabel,
+};
+const hookAgentProperties = {
+  agent: hookAgent, sessions: hookCount, events: hookCount, prompts: hookCount, toolStarts: hookCount,
+  toolEnds: hookCount, toolFailures: hookCount, interrupts: hookCount, permissionDenied: hookCount,
+  turnFailures: hookCount, openTools: hookCount, lastEventAt: hookDate,
+};
+const hookHistoryCounts = Object.fromEntries(['sessions', 'events', 'prompts', 'toolStarts', 'toolEnds', 'toolFailures', 'interrupts', 'permissionDenied', 'turnFailures', 'openTools'].map(key => [key, { type: ['integer', 'null'], minimum: 0, maximum: Number.MAX_SAFE_INTEGER }]));
+const hookActivityRange = object({ start: nullable(date), end: nullable(date) }, ['start', 'end']);
+const hookActivity = object({
+  events: hookAggregateCount, range: hookActivityRange, reason: { type: 'string', maxLength: 512 },
+  kinds: { ...array(object({ kind: hookKind, count: hookAggregateCount }, ['kind', 'count'])), minItems: 20, maxItems: 20 },
+  bins: { ...array(object({ start: hookDate, end: hookDate, count: hookAggregateCount, failures: hookAggregateCount, interrupts: hookAggregateCount }, ['start', 'end', 'count', 'failures', 'interrupts'])), maxItems: 12 },
+  sessions: { ...array(object({ key: { type: 'string', pattern: '^[a-f0-9]{64}$' }, agent: hookAgent, events: hookAggregateCount, prompts: hookAggregateCount, toolStarts: hookAggregateCount, turnFailures: hookAggregateCount, firstEventAt: hookDate, lastEventAt: hookDate }, ['key', 'agent', 'events', 'prompts', 'toolStarts', 'turnFailures', 'firstEventAt', 'lastEventAt'])), maxItems: 8 },
+  tools: { ...array(object({ tool: { ...hookIdentifier, type: 'string' }, starts: hookAggregateCount, ends: hookAggregateCount, failures: hookAggregateCount, interrupts: hookAggregateCount, unmatched: hookAggregateCount }, ['tool', 'starts', 'ends', 'failures', 'interrupts', 'unmatched'])), maxItems: 64 },
+  subagents: { ...array(object({ subagent: { ...hookLabel, type: 'string' }, starts: hookAggregateCount, stops: hookAggregateCount }, ['subagent', 'starts', 'stops'])), maxItems: 64 },
+}, ['events', 'range', 'reason', 'kinds', 'bins', 'sessions', 'tools', 'subagents']);
+const hookHistory = object({ scope: { const: 'cumulative' }, status: agentSourceStatus, reason: { type: 'string', maxLength: 512 }, sampledAt: hookDate,
+  range: hookActivityRange, totals: object(hookHistoryCounts, Object.keys(hookHistoryCounts)), activity: { anyOf: [hookActivity, { type: 'null' }] } }, ['scope', 'status', 'reason', 'sampledAt', 'range', 'totals', 'activity']);
+const hookReport = object({
+  status: agentSourceStatus, reason: { type: 'string', maxLength: 512 },
+  skippedLines: { type: ['integer', 'null'], minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  agents: { ...array(object(hookAgentProperties, Object.keys(hookAgentProperties))), maxItems: 16 },
+  events: { ...array(object(hookEventProperties, Object.keys(hookEventProperties))), maxItems: 200 },
+  history: hookHistory,
+}, ['status', 'reason', 'skippedLines', 'agents', 'events']);
 const taskProperties = { id: string, request_id: string, operation: string, status: string, profile: string, collection_status: string, raw_bytes: integer, collected_at: date, simulated: boolean, uploaded: boolean, inspection_id: string };
 
 const CACHE_LIMITS = [
@@ -73,11 +111,18 @@ const RESOURCE_LIMITS = [
   'Resource rankings are the collector top20 + agent20 union, not all host processes; every cached row is returned, not the UI Top10.',
   'Disk ranking rows measure B/s I/O, not directory size or disk-space ownership. Resource quantities have their original units.',
   'cleanable/action/effect fields are historical display metadata only; this API cannot execute them.',
+  'Power is the known CPU/GPU subtotal: sensors or utilization models with provenance; partial coverage is not complete host power, cumulative energy or session attribution.',
 ];
 const AGENT_LIMITS = [
   'AgentSight evidence uses a fixed 24h window; source coverage, filteredProcesses and lastScanAt bound the evidence, not all agents or all history.',
   'Health revision does not identify a new AgentSight scan; sampled_at and window identify its independent cache.',
   'Process evidence has PID but no starttime; it cannot establish a persistent OS process identity.',
+];
+const HOOK_LIMITS = [
+  'Independent agent hook lifecycle metadata in the report window, not AgentSight source coverage or merged session/process identities.',
+  'Windowed details use at most 5000 input events and 16 agent summaries, with the latest 200 normalized events. Optional cumulative history uses independent persistent counters unaffected by detail limits or rotation; records deleted before enablement cannot be recovered.',
+  'No prompt text, tool input/output, error body, raw payload or token usage. Failure/cancellation/permission denial and unmatched tool starts alone do not establish an Agent fault or hang.',
+  'Hook status, reason and skippedLines describe its own cache; empty events never establish complete observation or health.',
 ];
 const GPU_LIMITS = [
   'GPU diagnostics/job evidence is an on-demand short window (up to 10 seconds), not continuous history; status, complete and sampleWindowSeconds bound coverage.',
@@ -91,9 +136,9 @@ function definition(name, family, key, properties, fields, limitations, options 
 }
 const definitions = [
   definition('resources', 'health', 'resources', resourceProperties,
-    'id label usage capacity unit source status note quantity quantity.value quantity.unit quantity.total quantity.available rankLabel rankUnit sampledAt gpuDevices rows', RESOURCE_LIMITS),
+    'id label usage capacity unit source status note quantity quantity.value quantity.unit quantity.total quantity.available rankLabel rankUnit sampledAt gpuDevices rows power power.method power.cpuWatts power.gpuWatts power.missing power.processes power.unattributedCpuWatts', RESOURCE_LIMITS),
   definition('resource-rows', 'health', 'rows', { ...rowProperties, resource: resourceProperties.id, queryId: string },
-    'id queryId resource name detail usage cleanable defaultSelected effect quantity quantity.value quantity.unit pid starttime agentKind agentId sessions',
+    'id queryId resource name detail usage cleanable defaultSelected effect quantity quantity.value quantity.unit pid starttime agentKind agentId sessions powerSource referenceWatts',
     [...RESOURCE_LIMITS, 'Original row id is preserved and can repeat across resources. Detail lookup uses queryId = resource + ":" + original id (URI-encode the entire ID in the route).'], { idField: 'queryId' }),
   definition('inspections', 'health', 'inspections', inspectionProperties,
     'id label important phase status usage detail evidence execution', ['Only cached inspection evidence; unchecked/unavailable is not normal. No inspection is executed.']),
@@ -120,6 +165,10 @@ const definitions = [
     'id severity title detail suggestion', [...AGENT_LIMITS, 'Analyzer findings are not raw AgentSight events.', GENERATED_LIMIT], { generated: true }),
   definition('agent-coverage', 'agent', 'coverage', { id: string, ...coverageProperties },
     'id key status reason', [...AGENT_LIMITS, GENERATED_LIMIT], { generated: true }),
+  definition('agent-hook-events', 'agent', 'hookEvents', hookEventProperties,
+    'id agent kind occurredAt sessionId tool callId errorType interrupt subagent model', HOOK_LIMITS, { hooks: true }),
+  definition('agent-hook-agents', 'agent', 'hookAgents', { id: string, ...hookAgentProperties },
+    'id agent sessions events prompts toolStarts toolEnds toolFailures interrupts permissionDenied turnFailures openTools lastEventAt', [...HOOK_LIMITS, GENERATED_LIMIT], { hooks: true, generated: true }),
   definition('tasks', 'tasks', 'tasks', taskProperties,
     'id request_id operation status profile collection_status raw_bytes collected_at simulated uploaded inspection_id',
     ['At most 100 successful task metadata records from this controller process; not failures, global task history, raw data, secrets or system paths.']),
@@ -186,7 +235,8 @@ function snapshotId(view, def, index) {
 function rowsFor(view, def) {
   const state = view.state;
   let rows;
-  if (def.family === 'agent') rows = view.agent[def.key];
+  if (def.hooks) rows = view.agent.hooks?.[def.key === 'hookEvents' ? 'events' : 'agents'];
+  else if (def.family === 'agent') rows = view.agent[def.key];
   else if (def.family === 'tasks') rows = view.tasks.slice(0, 100);
   else if (def.key === 'resources') rows = RESOURCE_IDS.filter(id => own(state.resources, id)).map(id => state.resources[id]);
   else if (def.key === 'rows') rows = RESOURCE_IDS.flatMap(resource => (state.resources?.[resource]?.rows ?? []).map((row, index) => ({
@@ -235,7 +285,16 @@ function metadata(view, def) {
   let source = def.family === 'agent' ? agent?.source ?? 'agentsight' : def.family === 'tasks' ? 'controller' : healthSource(state);
   let status = 'unknown';
   let coverage = {};
-  if (ready && def.family === 'agent') {
+  if (def.hooks) {
+    source = 'agent-hooks';
+    if (ready) {
+      status = agent.hooks?.status ?? 'unknown';
+      coverage = {
+        scope: 'agent_hook_metadata', window: copyAllowed(agent.window, object({ start: date, end: date })),
+        reason: agent.hooks?.reason ?? '', skippedLines: agent.hooks?.skippedLines ?? null,
+      };
+    }
+  } else if (ready && def.family === 'agent') {
     const sources = (agent.coverage ?? []).map(item => copyAllowed(item, object(coverageProperties)));
     const entry = sources.find(item => item.key === def.key);
     status = entry?.status ?? (['findings', 'coverage'].includes(def.key) ? agent.status : 'unknown');
@@ -465,13 +524,25 @@ function openApiContract() {
     window: object({ start: date, end: date }, ['start', 'end']), lastScanAt: nullable(date), filteredProcesses: nullable(integer),
     status: gpuStatus, outcome: string, complete: boolean, sampled_at: nullable(date),
     jobAnalysis: object({ status: gpuStatus, complete: boolean, sampled_at: nullable(date), sampleWindowSeconds: nullable(number), reason: string }, ['status', 'complete', 'sampled_at', 'sampleWindowSeconds', 'reason']),
+    reason: { type: 'string', maxLength: 512 }, skippedLines: { type: ['integer', 'null'], minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
     scope: string, retained: { type: 'integer', minimum: 0, maximum: 100 }, maximum: { const: 100 },
   });
-  coverage.description = 'Source-specific coverage before filtering: per-resource/source statuses and timestamps; Agent fixed window, lastScanAt and filteredProcesses; GPU complete and short sample window; or process-local task retention.';
+  coverage.description = 'Source-specific coverage before filtering: per-resource/source statuses and timestamps; AgentSight fixed window, lastScanAt and filteredProcesses; independent agent-hooks window, reason and skippedLines (never AgentSight sources or report status); GPU complete and short sample window; or process-local task retention.';
   const meta = object({ source: nullable(string), status: string, sampled_at: nullable(date), revision: nullable(integer), coverage, limitations: array(string) }, ['source', 'status', 'sampled_at', 'revision', 'coverage', 'limitations']);
   const taskSchema = object(taskProperties);
   const healthState = object({ mode: enumeration('collected', 'demo'), hasGpu: boolean, revision: integer, sampledAt: date, resources: object(Object.fromEntries(RESOURCE_IDS.map(id => [id, object(resourceProperties)])), RESOURCE_IDS), inspections: array(object(inspectionProperties)), gpuDiagnostic, optimizations: array(object(optimizationProperties)), operations: array(object(operationProperties)) }, ['hasGpu', 'revision', 'sampledAt', 'resources', 'inspections', 'optimizations', 'operations']);
-  const agentReport = object({ source: enumeration('agentsight'), analyzer: enumeration('sysom-openapi'), sampledAt: date, window: object({ start: date, end: date }, ['start', 'end']), status: enumeration('ok', 'partial', 'unavailable'), outcome: enumeration('observed', 'abnormal', 'unknown'), summary: string, lastScanAt: nullable(date), filteredProcesses: nullable(integer), coverage: array(object(coverageProperties)), totals: object({ sessions: nullable(integer), inputTokens: nullable(integer), outputTokens: nullable(integer), unresolved: nullable(integer), critical: nullable(integer), high: nullable(integer) }), findings: array(object(agentFindingProperties)), processes: array(object(processProperties)), sessions: array(object(sessionProperties)), interruptions: array(object(interruptionProperties)), latency: array(object(latencyProperties)) }, ['source', 'analyzer', 'sampledAt', 'window', 'status', 'outcome', 'summary', 'lastScanAt', 'filteredProcesses', 'coverage', 'totals', 'findings', 'processes', 'sessions', 'interruptions', 'latency']);
+  const agentReport = object({
+    source: enumeration('agentsight'), analyzer: enumeration('sysom-openapi'), sampledAt: date,
+    window: object({ start: date, end: date }, ['start', 'end']), status: enumeration('ok', 'partial', 'unavailable'),
+    outcome: enumeration('observed', 'abnormal', 'unknown'), summary: string, lastScanAt: nullable(date), filteredProcesses: nullable(integer),
+    coverage: { ...array(object(coverageProperties)), minItems: 5, maxItems: 5 },
+    totals: object({ sessions: nullable(integer), inputTokens: nullable(integer), outputTokens: nullable(integer), unresolved: nullable(integer), critical: nullable(integer), high: nullable(integer) }),
+    findings: { ...array(object(agentFindingProperties)), maxItems: 527 }, processes: array(object(processProperties)),
+    sessions: array(object(sessionProperties)), interruptions: array(object(interruptionProperties)), latency: array(object(latencyProperties)), hooks: hookReport,
+    history: object({ scope: { const: 'all_stored' }, sampledAt: date, status: enumeration('ok', 'partial', 'unavailable'),
+      coverage: { ...array(object({ key: enumeration('usage', 'sessions', 'interruptionCounts'), status: agentSourceStatus, reason: { type: 'string', maxLength: 512 } }, ['key', 'status', 'reason'])), minItems: 3, maxItems: 3 },
+      totals: object(Object.fromEntries(['sessions', 'calls', 'inputTokens', 'outputTokens', 'unresolved', 'critical', 'high'].map(key => [key, { type: ['integer', 'null'], minimum: 0, maximum: Number.MAX_SAFE_INTEGER }])), ['sessions', 'calls', 'inputTokens', 'outputTokens', 'unresolved', 'critical', 'high']) }, ['scope', 'sampledAt', 'status', 'coverage', 'totals']),
+  }, ['source', 'analyzer', 'sampledAt', 'window', 'status', 'outcome', 'summary', 'lastScanAt', 'filteredProcesses', 'coverage', 'totals', 'findings', 'processes', 'sessions', 'interruptions', 'latency', 'hooks']);
   const summary = object({ score: number, n: integer, m: integer, x: integer, y: integer, otherAbnormal: integer, resourceAbnormal: integer, unchecked: integer, open: array({ oneOf: [object(inspectionProperties), object(resourceProperties)] }), band: object({ id: enumeration('red', 'orange', 'yellow', 'green'), color: string, label: string }), checked: integer, total: integer, unavailable: integer }, ['score', 'n', 'm', 'x', 'y', 'otherAbnormal', 'resourceAbnormal', 'unchecked', 'open', 'band', 'checked', 'total', 'unavailable']);
   const catalogField = object({ name: string, type: enumeration('string', 'number', 'integer', 'boolean', 'object', 'array'), nullable: boolean, filter: boolean, range: boolean, sort: boolean, project: { const: true }, enum: array({ type: ['string', 'number'] }), format: string }, ['name', 'type', 'nullable', 'filter', 'range', 'sort', 'project']);
   const schemas = {

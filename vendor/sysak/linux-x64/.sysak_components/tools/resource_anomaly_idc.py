@@ -1,3 +1,7 @@
+# the RPM %install stage byte-compiles with python2; this keeps print()
+# parseable there (no-op under python3, which is what actually runs)
+from __future__ import print_function
+
 import errno
 import json
 import os

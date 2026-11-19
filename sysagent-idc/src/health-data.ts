@@ -24,6 +24,8 @@ export interface ResourceRow {
   defaultSelected: boolean;
   effect: string;
   quantity?: { value: number; unit: 'B' | 'B/s' | 'W' | 'count' };
+  powerSource?: 'rapl' | 'gpu-sensor' | 'cpu-model' | 'gpu-model';
+  referenceWatts?: number;
   pid?: number;
   starttime?: number;
   agentKind?: string;
@@ -110,6 +112,14 @@ export interface ResourceSnapshot {
   rankUnit?: '%' | 'B' | 'B/s' | 'W' | 'count';
   sampledAt?: string;
   gpuDevices?: GpuDevice[];
+  power?: {
+    method: 'measured' | 'estimated' | 'mixed' | 'unavailable';
+    cpuWatts: number | null;
+    gpuWatts: number | null;
+    missing: Array<'cpu' | 'gpu'>;
+    processes: ResourceRow[];
+    unattributedCpuWatts: number | null;
+  };
   rows: ResourceRow[];
 }
 
@@ -155,8 +165,11 @@ export function recognizeAgent(name: string): string | undefined {
   return Object.hasOwn(agentProcessNames, key) ? agentProcessNames[key] : undefined;
 }
 
-export function collectedRankingRows(resource: ResourceSnapshot, agentOnly: boolean) {
-  return resource.rows.filter(row => !agentOnly || !!row.agentKind).slice().sort((a, b) => b.usage - a.usage || (a.pid ?? 0) - (b.pid ?? 0)).slice(0, 10);
+export function collectedRankingRows(resource: ResourceSnapshot, agentOnly: boolean, query = '') {
+  const needle = query.trim().toLocaleLowerCase();
+  const rows = resource.id === 'energy' ? resource.power?.processes ?? [] : resource.rows;
+  return rows.filter(row => (!agentOnly || !!row.agentKind) && (!needle || row.name.toLocaleLowerCase().includes(needle) || String(row.pid ?? '').includes(needle)))
+    .slice().sort((a, b) => b.usage - a.usage || (a.pid ?? 0) - (b.pid ?? 0)).slice(0, 10);
 }
 
 export interface Optimization {
@@ -402,13 +415,23 @@ export function formatResourceValue(resource: ResourceSnapshot): string {
   return '不可用';
 }
 
+export function powerMethodLabel(resource: ResourceSnapshot): string {
+  return resource.power?.method === 'estimated' ? '估算功率' : resource.power?.method === 'mixed' ? '测量 + 估算' : resource.power?.method === 'unavailable' ? '功率不可用' : '实测功率';
+}
+
 export function formatResourceQuantity(resource: ResourceSnapshot): string {
   const quantity = resource.quantity;
   if (resource.status === 'unavailable') return '本次未取得测量值';
   if (quantity?.unit === 'B') {
     return `${formatBytes(quantity.value)}${quantity.total !== undefined ? ` / ${formatBytes(quantity.total)}` : ''}${quantity.available !== undefined ? ` · 可用 ${formatBytes(quantity.available)}` : ''}`;
   }
-  if (quantity?.unit === 'W') return '实测功率 · 非能耗预算占比';
+  if (quantity?.unit === 'W') {
+    if (!resource.power) return powerMethodLabel(resource);
+    return (['cpu', 'gpu'] as const).filter(key => key === 'cpu' || resource.power!.gpuWatts !== null || resource.power!.missing.includes('gpu')).map(key => {
+      const watts = key === 'cpu' ? resource.power!.cpuWatts : resource.power!.gpuWatts;
+      return `${key.toUpperCase()} ${watts === null ? '未知' : `${Number(watts.toFixed(1))} W${resource.power!.missing.includes(key) ? '（部分）' : ''}`}`;
+    }).join(' · ');
+  }
   if (resource.capacity !== null && resource.usage !== null) {
     return `${(resource.capacity * resource.usage / 100).toFixed(1)} / ${resource.capacity} GB`;
   }
@@ -691,8 +714,8 @@ export function buildHealthReport(state: HealthState, device: { name: string }):
     .map((id) => {
       const resource = state.resources[id];
       if (!collected) return `${resource.label}：${formatResourceValue(resource)}${id === 'energy' ? ' · 预算占比估算，非实测能耗' : ''}`;
-      const ranks = resource.rows.slice(0, 10).map((row) => `  ${row.pid !== undefined ? `PID ${row.pid} · ` : ''}${row.name}：${formatRankingValue(resource, row)}`).join('\n');
-      return `${resource.label}：${formatResourceValue(resource)} · ${formatResourceQuantity(resource)}
+      const ranks = (id === 'energy' ? collectedRankingRows(resource, false) : resource.rows.slice(0, 10)).map((row) => `  ${row.pid !== undefined ? `PID ${row.pid} · ` : ''}${row.name}：${formatRankingValue(resource, row)}${id === 'energy' ? ' · 估算，非逐进程实测' : row.powerSource ? ` · ${row.detail}` : ''}`).join('\n');
+      return `${resource.label}：${formatResourceValue(resource)}${resource.power ? ` · ${powerMethodLabel(resource)}` : ''} · ${formatResourceQuantity(resource)}
 来源：${resource.source ?? 'sysak'} · 状态：${resource.status ?? (resource.usage === null && !resource.quantity ? 'unavailable' : 'available')} · 采样：${localTime(resource.sampledAt ?? state.sampledAt)}
 范围：${resource.note ?? '仅当前采集范围；排行不代表全部系统占用'}
 ${resource.rankLabel ?? '资源排行'}（${resource.rankUnit ?? '%'}）

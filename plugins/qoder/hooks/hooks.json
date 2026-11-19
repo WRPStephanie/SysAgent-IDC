@@ -1,0 +1,365 @@
+{
+  "description": "SysAgent管家：记录 Agent 生命周期元数据供本机 Agent 诊断使用，并在会话开始时注入本机健康缓存摘要",
+  "hooks": {
+    "SessionStart": [
+      {
+        "async": false,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "SessionStart"
+            ],
+            "name": "sysagent-session-start",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "SessionEnd"
+            ],
+            "name": "sysagent-session-end",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "UserPromptSubmit"
+            ],
+            "name": "sysagent-user-prompt-submit",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PreToolUse"
+            ],
+            "name": "sysagent-pre-tool-use",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PostToolUse"
+            ],
+            "name": "sysagent-post-tool-use",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PostToolUseFailure"
+            ],
+            "name": "sysagent-post-tool-use-failure",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PermissionRequest"
+            ],
+            "name": "sysagent-permission-request",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PermissionDenied"
+            ],
+            "name": "sysagent-permission-denied",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "Stop"
+            ],
+            "name": "sysagent-stop",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "StopFailure"
+            ],
+            "name": "sysagent-stop-failure",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "SubagentStart"
+            ],
+            "name": "sysagent-subagent-start",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "SubagentStop"
+            ],
+            "name": "sysagent-subagent-stop",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PreCompact"
+            ],
+            "name": "sysagent-pre-compact",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "PostCompact"
+            ],
+            "name": "sysagent-post-compact",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "Notification"
+            ],
+            "name": "sysagent-notification",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "TaskCreated"
+            ],
+            "name": "sysagent-task-created",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "TaskCompleted"
+            ],
+            "name": "sysagent-task-completed",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "TeammateIdle"
+            ],
+            "name": "sysagent-teammate-idle",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Elicitation": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "Elicitation"
+            ],
+            "name": "sysagent-elicitation",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "ElicitationResult": [
+      {
+        "async": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py",
+              "qoder",
+              "ElicitationResult"
+            ],
+            "name": "sysagent-elicitation-result",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

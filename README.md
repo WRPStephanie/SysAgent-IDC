@@ -1,73 +1,52 @@
 # SysAgent 管家
 
-SysAgent 是面向 Linux 工作站的本地资源与 Agent 诊断工具，提供 **Electron 桌面应用**和 **VS Code 兼容 IDE 插件**。
+SysAgent 是面向 Linux 工作站的本机资源与 Agent 诊断工具，提供 **Electron 桌面应用**和 **VS Code 兼容 IDE 插件**。两端共用页面与诊断逻辑，无需同时运行。
 
-- 查看本机资源、进程和体检结果，执行有界诊断。
-- 分析已采集的 Agent 会话、中断和调用延迟，优先展示诊断结论与证据。
-- 配置 SysOM 凭据后，把采集快照上传云端巡检，并在体检首页展示云端结论与报告。
-- 桌面与 IDE 共用诊断逻辑，不需要同时运行两个客户端。
-- 提供本机只读 HTTP API，供其他工具查询已缓存的诊断结果。
+- **体检与资源：** 查看 CPU、内存、磁盘、GPU、功率、进程排行、检查证据和报告。
+- **Agent 管家：** 查看 Hook 活动累计统计、会话轨迹、工具与协作记录，以及 AgentSight 提供的会话、Token、中断和调用延迟。
+- **云端巡检：** 显式提供 SysOM 凭据后上传本次资源快照，查看云端结论与报告。
+- **本机查询：** 其他受信程序通过只读 HTTP API 获取已有缓存，不触发采集或执行操作。
 
-系统资源诊断由**当前用户直接调用系统已安装的 sysAK `idc_inspect`**（采集 schema 1.1），再经本机回环 OpenAPI 解析为展示数据；Agent 诊断使用独立的 AgentSight 运行时。主 deb 安装的 `sysom-idc.service` 只用于 AgentSight 主机级采集控制，不再是资源采集的前提。服务不可用或证据缺失时会明确提示，不把空数据当作健康结论。部分非核心页面仍含演示内容，详见[功能指南](./docs/FUNCTION-USER-GUIDE.md)。
+**缺失数据不等于零，空列表不等于健康。** 设备接入、研发运维、日志分析和部分 GPU 案例属于演示，不代表已接入远端系统。
 
-当前版本：**SysAgent 0.2.19 / AgentSight 0.16.0**。
+## 阅读入口
 
-- [快速开始](#快速开始)
-- [安装与首次运行](#安装与首次运行)
-- [云端巡检与上传](#云端巡检与上传)
-- [Agent 采集与隐私](#agent-采集与隐私)
-- [开发与测试](#开发与测试)
-- [常见问题](#常见问题)
-- [源码交付与许可](#源码交付与许可)
+| 你想做什么 | 阅读位置 |
+| --- | --- |
+| 安装并开始使用 | 本文“安装与首次运行” |
+| 理解所有页面、指标和操作 | [功能指南](./docs/FUNCTION-USER-GUIDE.md) · [浏览器阅读版](./docs/FUNCTION-USER-GUIDE.html) |
+| 在 IDE 中使用 | [IDE 插件说明](./sysagent-ide-extension/README.md) |
+| 让脚本读取结果 | [本机只读 HTTP API](./docs/LOCAL-HTTP-API.md) |
+| 从源码构建或维护交付件 | [打包说明](./docs/PACKAGING.md) · [开发说明](./docs/DEVELOPMENT.md) |
+| 理解采集与接口边界 | [技术设计](./docs/SYSAGENT-IDC-OPENAPI-DETAILED-DESIGN.md) |
 
-## 快速开始
-
-### 1. 准备环境
+## 环境与组件
 
 | 场景 | 要求 |
 | --- | --- |
-| 构建 deb 与 VSIX | Linux x86_64 / amd64、Node.js 20+、npm、`dpkg-deb`，建议至少 3 GiB 可用空间；SysAK 输入须含 `idc_inspect`（见[已知构建缺口](#3-一键构建)） |
-| 首次构建 | 联网安装 npm 依赖及下载 Electron 打包工具 |
-| 运行桌面应用 | Linux x64 图形桌面、glibc 2.38+；建议 Ubuntu 24.04 x64 |
-| 系统资源采集 | 系统已安装含 `idc_inspect` 组件的 sysAK（`/usr/bin/sysak`、`/usr/local/bin/sysak` 或 `PATH` 中）与 Python 3；以当前用户运行，不需要 root 服务 |
-| 受控进程结束 | 同上系统 sysAK；sysAK 内部使用 pidfd（Python 3.9+、可用 Linux pidfd），目标限当前用户可核实身份的非保护进程 |
-| AgentSight 主机级采集控制 | systemd、已安装主 deb 的 root 辅助服务与授权 UID（`SYSOM_IDC_UID`） |
-| 云端巡检上传 | 可达的 SysOM POP endpoint 与 AK/SK（环境变量注入）；未配置时纯本地运行 |
-| 运行 IDE 插件 | VS Code API 1.85+ 的兼容宿主，例如 VS Code 或 Qoder IDE |
+| 桌面运行 | Linux x86_64 图形桌面、glibc 2.38+；建议 Ubuntu 24.04 x64 |
+| IDE 运行 | VS Code API 1.85+ 兼容宿主，例如 VS Code、Qoder IDE；Qoder Desktop 独立应用和 JetBrains 不支持该 VSIX |
+| 系统资源与进程操作 | 本机已安装含 `idc_inspect` 的 sysAK，当前用户可执行；进程操作还需 Python 3.9+ 和 Linux pidfd 支持 |
+| AgentSight 诊断 | 配套独立运行时，或明确配置的可用本机 AgentSight API |
+| Qoder Hook 插件运行 | 支持插件 Hook 的 Qoder 宿主、Linux、`python3 >= 3.6`，仅使用 Python 标准库 |
+| deb 与 VSIX 构建 | Linux x86_64、Node.js 20+、npm、`dpkg-deb`，预留依赖与打包所需空间 |
+| 仅构建 Hook ZIP | Node.js 20+，无需 npm 依赖、Python 或原生组件 |
 
-**构建不需要 root、图形会话或运行采集服务。** 安装 deb 需要管理员授权，日常运行应用与 IDE 使用普通用户。Qoder Desktop 独立应用和 JetBrains 不是此 VSIX 的宿主；其他发行版尚未逐一认证。
+安装系统 deb 需要管理员授权，日常运行桌面与 IDE 使用普通用户。**不要用 sudo 启动 GUI、禁用沙箱或跳过依赖检查。** 其他发行版需自行核对运行库、驱动与权限。
 
-检查构建工具：
+### 三条独立数据链路
 
-```bash
-node --version
-npm --version
-dpkg-deb --version
-```
+1. **资源与体检：** 当前用户直接运行系统 sysAK `idc_inspect`，本机分析服务解析资源、检查与 GPU 证据。主 deb 不安装系统 sysAK。
+2. **Hook 活动：** Qoder 插件写入白名单事件元数据与独立累计数据库；不采集提示词、工具输入输出或对话正文。
+3. **AgentSight：** 独立 API 提供已采集的会话、Token、中断、延迟与进程探活。API 可用不代表真实调用采集已开启。
 
-### 2. 获取完整源码
+每个宿主有独立资源缓存、巡检设置和查询实例。相同用户环境可以复用 Hook 存储与 AgentSight 来源，但不会自动同步两个宿主的资源快照。
 
-克隆本仓库，或通过仓库的 **Code → Download ZIP** 下载并解压完整源码。在包含 `package.json` 的项目根目录打开终端；以下构建命令均在这里执行。
+## 安装与首次运行
 
-请保留完整的 `vendor/` 目录，包括隐藏的 `.sysak_components/`。仓库提供 Linux x64 SysAK、AgentSight 预编译输入及官方未修改的 GX 0.6.5-2 deb，**不需要 Git LFS 或子模块**，也不要只下载某个子项目目录。注意当前随附的 SysAK 输入是旧四命令包，完整包构建前需按[已知构建缺口](#3-一键构建)替换为含 `idc_inspect` 的产物。
+### 1. 获取并校验完整交付件
 
-### 3. 一键构建
-
-```bash
-npm run build
-```
-
-无需先在根目录运行 `npm install`：脚本会检查版本、准备并校验 SysAK、校验 AgentSight 和 GX 输入、在两个子项目执行 `npm ci`、编译 SysAgent 源码，再生成三个 deb 与 VSIX。
-
-> **已知构建缺口（当前源码状态）：** 运行时、打包校验和 IDE 构建都已要求 sysAK 提供 `idc_inspect`，但仓库随附的 `vendor/sysak/linux-x64/` 仍是旧四命令包（`idc` / `resource_anomaly` / `memgraph` / `ai`）。因此 `npm run build`、`build:desktop`、`build:ide` 会在 SysAK 准备步骤失败：
->
-> ```text
-> prepare:sysak: Missing idc_inspect rule with python-dep{python3}
-> ```
->
-> 解决办法是先用含 `idc_inspect` 的 sysAK 构建产物替换该 vendor 输入（同步 `manifest.json` 的 `commands` 与文件哈希），或用 `SYSAK_BUNDLE_DIR` / `npm --prefix sysagent-idc run prepare:sysak -- --source <产物目录>` 指向该产物后重试。`npm run build:web` 不经过这一步，不受影响。缺口修复前不要声称完整包构建通过。
-
-产物目录结构：
+使用可信来源的完整构建目录，不要混用不同构建的 deb、VSIX 和校验文件。
 
 ```text
 release/build-0.2.19/
@@ -75,6 +54,8 @@ release/build-0.2.19/
 ├── gx_0.6.5-2_amd64.deb
 ├── sysom-agentsight-runtime_0.16.0_amd64.deb
 ├── sysagent-ide-0.2.19.vsix
+├── sysagent-qoder-plugin-0.2.19.zip
+├── sysagent-qoder-ide-plugin-0.2.19.zip
 ├── agentsight-runtime/
 ├── install-debs.sh
 ├── SHA256SUMS
@@ -83,262 +64,209 @@ release/build-0.2.19/
 └── FONT_LICENSE
 ```
 
-| 产物 | 用途 |
-| --- | --- |
-| 主 SysAgent deb | 桌面应用、采集/查询控制器，以及 AgentSight 采集控制用的 root 辅助服务；资源采集本身调用系统 sysAK。精确依赖 `gx (= 0.6.5-2)` 和 `sysom-agentsight-runtime (= 0.16.0)`，**不依赖也不代装系统 sysAK** |
-| GX deb | 官方未修改的 GX 0.6.5-2 原生运行时，随本批次再分发 |
-| AgentSight runtime deb | 独立 AgentSight 配套运行时，版本仍为 0.16.0 |
-| VSIX | IDE 插件；内含 SysAK 私有 bundle 供本地 manifest 核对与采集控制，资源采集仍调用系统 sysAK；不内嵌 AgentSight |
-| `agentsight-runtime/` | 独立配套目录，含二进制、manifest、许可及部署工具 |
-| `install-debs.sh` / `SHA256SUMS` | 同批次安装入口与完整性校验 |
+在该目录打开终端，执行 `sha256sum --check SHA256SUMS`。校验失败时不要安装；校验只确认文件完整性，不能代替可信来源验证。
 
-`npm run release` 使用同一入口。构建只编译和打包，**不安装系统服务、不开启真实采集、不结束进程、不上传云端或发布件**。此入口使用随仓库提供的 SysAK/AgentSight 二进制及官方未修改的 GX deb，不进行 SysAK、AgentSight、GX 或完整上游 coolbpf 的重新编译，也不生成 AppImage。
+### 2. 安装桌面与配套件
 
-0.2.19 批次的 SysAK `ai` 输入已从原生 Rust 源码单独重新编译，并通过执行追踪确认调用官方 GX 0.6.5-2；SysAK 启动器、其他诊断工具及 AgentSight 沿用已校验输入。独立 `ai` 不依赖 coolbpf 的 `CollectionFramework`，不能把后者的版本补丁当作 `ai` 的编译内容。当前机器没有计算 GPU，只验证无 GPU/驱动分支，不代表 GPU 硬件诊断认证。
-
-只需要部分产物时：
-
-```bash
-npm run build:desktop              # 主 deb + GX deb + AgentSight runtime deb
-npm run build:ide                  # 仅 VSIX
-npm run build:web                  # 仅网页生产构建，不下载 Electron 二进制
-npm run build -- --skip-install    # 已安装依赖后复用；首次构建不要使用
-npm run build -- --help
-```
-
-仅构建 VSIX 不会生成 AgentSight runtime deb。需要 Agent 诊断时，使用完整构建取得配套运行时，或使用已安装的兼容运行时。
-
-Electron 下载默认使用项目内置镜像，可用 `ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR` 环境变量覆盖；脚本不修改 npm 或 Git 配置。
-
-## 安装与首次运行
-
-已有可信来源的发布包时可以跳过构建，在包含三个 deb（GX、AgentSight runtime、主 SysAgent）、安装脚本和 `SHA256SUMS` 的产物目录执行以下步骤。生成安装包并不等于安装，修改源码也不会更新已安装程序。
-
-### 1. 校验产物
-
-从项目根目录进入本次构建目录：
-
-```bash
-cd release/build-0.2.19
-sha256sum --check SHA256SUMS
-```
-
-所有项目应显示 `OK`。校验失败时不要安装，请重新构建或重新获取完整发布包。校验确认传输完整性，不代替可信来源验证。
-
-### 2. 安装桌面端与配套运行时
-
-以将要使用 SysAgent 的普通用户执行：
+先彻底退出正在运行的 SysAgent 客户端，再以日常使用应用的普通用户执行：
 
 ```bash
 sh ./install-debs.sh
 sysagent-idc
 ```
 
-按提示提供管理员授权，随后也可从应用菜单打开“SysAgent管家”。**不要只安装主 deb**：它精确依赖 GX 0.6.5-2 和同批次 AgentSight runtime 0.16.0。安装入口离线安装三个本地 deb，顺序为 **GX → AgentSight runtime → 主 SysAgent**。
+安装脚本请求管理员授权，用一次 `dpkg --install` 按 **GX → AgentSight runtime → 主 SysAgent** 顺序安装三个本地 deb，不联网补齐依赖、不自动回滚。缺依赖时由管理员补齐后重跑入口，不要只安装主 deb。也可从应用菜单打开“SysAgent管家”。
 
-仅在包安装阶段，root 辅助程序 `sysagent-idc/build/gx-runtime.py` 验证 GX 已配置为 `install ok installed` 且版本为 `0.6.5-2`，检查 `/usr/bin/gx`、`/usr/lib64/libgx.so`、`/usr/lib64/libgx_client.so`、`/usr/lib64/libgx_nvinfo.bin`、`/usr/lib64/libgx_amdinfo.bin` 和 `/etc/libgx.yaml` 的存在及路径安全性，并确认 GX 可执行。随后创建 `/etc/ld.so.conf.d/sysagent-gx.conf`（内容为 `/usr/lib64` 加换行；已有文件须内容一致且安全），执行 `ldconfig`。`/usr/share/gx/lib` 是 GX 可执行文件的 RPATH，不加入全局动态库加载路径。
+GX 提供 GPU 原生运行时，AgentSight runtime 提供独立 Agent 诊断来源。主 deb 包含桌面、控制器和 AgentSight 采集控制辅助服务；**不安装、不下载系统 sysAK**。安装不会自动开启主机级 Agent 调用采集。
 
-GX 原生组件实际需要 glibc 2.27+、`zlib1g` 和 `libzstd1`；主 SysAgent deb 补充声明这些运行库依赖，不修改官方 GX 包。安装入口不联网下载或补齐系统依赖，也不自动回滚。缺少系统库时先由管理员补齐，再重新运行安装入口；不要强制跳过依赖、禁用沙箱或用 `sudo` 启动 GUI。GUI 启动不会下载 GX、提权或执行上述 root 辅助程序。包安装与动态库路径就绪不证明 GPU 跟踪可用；真实 GPU 跟踪仍依赖硬件和驱动，本次未证明其可用性。
+### 3. 准备系统资源来源
 
-默认安装不会启用新的主机级 Agent 调用采集。升级保留已有配置、数据和授权选择；安装前请彻底退出旧客户端。直接以 root 登录安装不能作为首次普通用户授权的默认方式。
+资源采集使用本机已安装、组件完整的 sysAK，解析顺序为：
 
-**资源采集另需系统 sysAK。** 主 deb 不安装、不下载 sysAK，也不把私有 bundle 用于资源采集。应用启动时按 `SYSOM_SYSAK_BIN`（若设置）→ `/usr/bin/sysak` → `/usr/local/bin/sysak` → `PATH` 顺序查找可执行文件，并要求其二进制同目录的 `.sysak_components/`（或 `/usr/local/sysak/.sysak_components/`）中存在可读的 `tools/idc_inspect` 与对应 `.sysak.rules` 条目；缺失时分别报 `SYSAK_NOT_FOUND` / `SYSAK_COMPONENT_MISSING`，页面显示不可用而不是回退到演示数据。组件缺失时 sysAK 会尝试联网下载，控制器在启动前拦截，因此请由管理员安装完整的 sysak 软件包。
+```text
+SYSOM_SYSAK_BIN → /usr/bin/sysak → /usr/local/bin/sysak → PATH
+```
 
-### 3. 安装 IDE 插件（可选）
+需要可执行的 sysak、可读的 `tools/idc_inspect` 与匹配规则。找不到二进制时报 `SYSAK_NOT_FOUND`，缺组件时报 `SYSAK_COMPONENT_MISSING`；管家会停止该次采集，不联网下载组件、不以演示数据替代。
 
-推荐先安装三个 deb，再在 IDE 命令面板选择 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**，选择 `sysagent-ide-0.2.19.vsix`，按提示重载 IDE。
+包内私有 sysAK bundle 供 AgentSight 采集控制核对使用，不是资源采集来源。`sysom-idc.service` 只承担 AgentSight 采集控制，不是资源采集的前提。
 
-VS Code 用户也可在产物目录执行：
+### 4. 在 IDE 中使用（可选）
+
+在命令面板选择 **Extensions: Install from VSIX… / 扩展: 从 VSIX 安装…**，选择交付目录中的 VSIX，按提示重载 IDE。VS Code 也可执行：
 
 ```bash
 code --install-extension ./sysagent-ide-0.2.19.vsix
 ```
 
-点击状态栏 SysAgent 入口，或执行 **SysAgent管家: 打开体检主页**。无需同时运行桌面应用。插件诊断本地扩展宿主所在机器，不自动诊断远程工作区；相同 HOME/XDG 环境下，两端共享 AgentSight 用户目录，但巡检设置各自保存。
+点击状态栏 SysAgent，或执行 **SysAgent管家: 打开体检主页**（`sysagent.openHome`）；`sysagent.inspect` 提供巡检入口。无需同时启动桌面应用。插件读取本地扩展宿主机器，不自动诊断 SSH 远程工作区。
 
-只需要 IDE 内 Agent 诊断时，可只安装配套 runtime deb 和 VSIX：
+仅需 IDE 内 AgentSight 诊断时，可以安装 runtime deb 与 VSIX，不安装桌面主 deb。此方式不建立主机级采集控制服务；系统资源仍需宿主机器上的完整 sysAK。详见[IDE 说明](./sysagent-ide-extension/README.md)。
 
-```bash
-sudo dpkg --install ./sysom-agentsight-runtime_0.16.0_amd64.deb
-code --install-extension ./sysagent-ide-0.2.19.vsix
-```
+### 5. 查看第一份结果
 
-此方式不安装主 deb 的辅助服务，因此没有 AgentSight 主机级采集控制；VSIX 本身不会安装系统服务。IDE 的资源采集仍取决于扩展宿主机器上是否已安装含 `idc_inspect` 的系统 sysAK。
+1. 打开体检首页，先看采样时间、可用资源与未检查项，再看评分。
+2. 从资源“详情”查看进程 Top10，按名称或 PID 搜索，或筛选 Agent。
+3. 进入 Agent 管家，刷新诊断；Hook 与 AgentSight 各自缺失时，分别查看“数据接入”的原因。
+4. 查看逐卡 GPU 资源；原生 GPU 检查和作业证据需按需执行，资源刷新不等于深度检查。
+5. 导出已有报告；刷新失败保留的结果会标为旧结果，应按原采样时间理解。
 
-### 4. 查看第一份报告
+关闭或最小化桌面主页会收起为悬浮小管家。单击恢复、拖动调整位置，右键选择“退出”才会彻底退出。退出宿主停止该实例的巡检与查询服务，不自动停止独立 AgentSight 服务。
 
-1. 打开体检主页，查看本机资源和进程；系统 sysAK 未就绪时先按上面的说明检查安装与组件。
-2. 打开 **Agent 管家**，等待本地服务准备完成，再刷新报告；可在总览、会话、中断、延迟之间切换。
-3. 首次没有已采集历史时，列表可能为空、指标可能显示 `—`；API 连通不等于已开启真实采集，也不等于业务健康。
-4. 刷新失败会保留上次报告并标记旧结果，不要把旧结果当作本次状态。
-5. 已配置 SysOM 凭据时，刷新后体检首页会追加云端巡检进度或结论；点击“体检报告”查看云端报告详情。未配置凭据时只有本地报告，见[云端巡检与上传](#云端巡检与上传)。
+## 功能与数据口径
 
-诊断不会自动重启 Agent、部署模型或发起付费调用。进程清理需要单独确认，可能中断真实任务。关闭主页会收起到悬浮小管家，右键小管家选择“退出”才会彻底退出。
+### 体检、资源与功率
 
-详细操作和指标解释见[功能指南](./docs/FUNCTION-USER-GUIDE.md)或[浏览器版指南](./docs/FUNCTION-USER-GUIDE.html)。指南配图为标注过的人工样例，不代表你的机器实测结果。
+首页展示当前资源、评分、检查状态、已有证据与巡检配置。巡检周期为 1–1440 分钟，默认 5 分钟，每个宿主独立保存；暂停或退出宿主停止本实例巡检。
 
-## 云端巡检与上传
+- CPU 排行是进程占整机 CPU 的份额；内存是 RSS；磁盘排行是进程读写 I/O 速率（B/s），不是目录占用。
+- 能耗展示当前功率（W），不是累计电量（kWh）。CPU 优先使用 RAPL，否则按负载估算；GPU 优先使用传感器，否则按利用率与功率上限估算。
+- 能耗详情先列 CPU/GPU 功率及来源，再列进程 CPU 功率估算 Top10；未归因 CPU 功率单独显示，不强行分摊 GPU 或 Session 功率。
+- 进程结束只允许当前用户的非受保护进程，必须二次确认与 PID/starttime 复核，发送 SIGTERM，不删文件、不自动强杀，也不保证进程已退出。
 
-资源采集与云端分析是两段独立职责：**sysAK 负责上传（步骤 1–4），桌面/IDE 只负责读取分析结果（步骤 5）**。
+未检查、受限、不可用项没有正常结论；高分不能证明全部项目完成。详细公式、单位与操作步骤见[功能指南](./docs/FUNCTION-USER-GUIDE.md)。
 
-| 步骤 | 执行方 | 调用 |
-| --- | --- | --- |
-| 1 | sysAK `idc_inspect` | `CreateHostInspectionUploadUrl`（`POST /api/v1/inspectionAgent/createHostInspectionUploadUrl`） |
-| 2 | sysAK `idc_inspect` | `PUT` 预签名对象，上传本次采集快照 |
-| 3 | sysAK `idc_inspect` | `SubmitHostInspection`（`POST /api/v1/inspectionAgent/submitHostInspection?inspectionId=…`） |
-| 4 | 后端 | 分析并生成报告 |
-| 5 | 桌面/IDE 主进程或扩展宿主 | `GetHostInspection` 轮询 + `GetInspectionReport` 取报告 |
+### Agent 管家
 
-**默认不上传。** 未提供凭据时控制器 `status.mode` 为 `mock`（本机回环部署标签，不代表数据是模拟的），只做本地采集与解析，不访问外部服务。提供下列环境变量后 `status.mode` 变为 `pre`，sysAK 才在采集后自动上传：
+顶部六张卡片为 **Hook 累计历史**：已记录会话、Hook 事件、提交提问、工具开始、轮次失败、未配对开始。独立 SQLite 累计不受明细轮转、筛选或分页影响；累计不可用显示 `—`，不从最新明细推算全历史。记录启用前已删除的数据无法恢复。
 
-| 变量 | 说明 |
+| 视图 | 内容 |
 | --- | --- |
-| `SYSOM_POP_ENDPOINT` | 必需，SysOM POP 网关地址（取 host 部分，HTTPS） |
+| 总体统计 | 活动趋势、事件构成、会话活动排行、工具活动排行、分类统计、需关注问题、调用延迟和进程探活 |
+| 会话与明细 | Hook 会话、按时间排列的轨迹、近 24h Agent 汇总、最新事件筛选与只读证据 |
+| 工具与协作 | 工具回调、子 Agent、任务与交互、授权、上下文压缩和工具累计表 |
+| 会话 | AgentSight 会话、模型、计数、已记录 Token 与关联中断 |
+| 中断 | AgentSight 中断类型筛选、只读证据和已有会话跳转 |
+| 延迟 | TTFT P95、E2E P95、TPS P50、TPOT P95 与调用样本量 |
+| 数据接入 | Hook 与 AgentSight 的独立覆盖状态、时间和限制 |
+
+点击趋势、类别、工具或分类入口筛选**已经取得的最新 Hook 明细**；累计排行不保证相应明细仍保留。列表提供分页，事件、分类与工具表可选每页 5/10/20 条。进程探活支持名称/PID、角色与状态组合筛选，每页 20 条；这些本地操作不追加采集。
+
+Hook 近 24h 汇总最多处理 5,000 条事件和 16 个 Agent，返回最新 200 条明细。AgentSight 使用近 24 小时窗口，进程最多 256、会话最多 500、中断明细最多 200；Token 包含辅助调用和已记录缓存用量，不是费用或会话终身累计。两种来源不跨来源关联 Session ID 或 PID。
+
+## Qoder Hook 插件
+
+Hook 插件与 VSIX、AgentSight 真实调用采集独立，不需要 root、pip、sysAK 或 AgentSight。
+
+1. 校验交付目录的 `SHA256SUMS`。
+2. Qoder 独立应用／CLI 导入 `sysagent-qoder-plugin-0.2.19.zip`；Qoder IDE 导入 `sysagent-qoder-ide-plugin-0.2.19.zip`。
+3. 在宿主插件界面确认已启用，按提示重载；Qoder IDE 的 Hook 配置需要重启 IDE。
+4. 产生正常活动后，在 SysAgent 的 Agent 管家刷新并查看来源状态。生成 ZIP 不等于已安装或启用。
+
+独立变体注册 20 个事件，IDE 变体注册 12 个事件（含通知）。覆盖会话生命周期、提问提交、工具回调、授权、子 Agent 和上下文压缩；独立变体还提供轮次失败、任务、队友空闲、信息补充与压缩完成等事件。事件表见[功能指南](./docs/FUNCTION-USER-GUIDE.md)。
+
+- 只保存 Agent、事件类型与时间、Session/Call ID、工具名、结构化错误类型、中断标志、子 Agent 与模型。**不保存提示词、正文、cwd、工具输入输出或错误文本，不读取会话文件。**
+- 只有 `SessionStart` 同步只读查询本机 `/api/v1/summary` 缓存并注入短摘要；查询失败或无缓存不注入。其他 Hook 异步记录，不查询、不注入、不触发采集或付费调用。
+- 存储位于 `~/.local/state/sysagent/agent-hooks/`，绝对 `XDG_STATE_HOME` 可改变根目录；明细每 1 MiB 轮转，`history.sqlite3` 独立保存累计。
+- 目录 0700、文件 0600。权限、所有权或符号链接不安全时拒绝，不自动修复；失败不阻断 Agent。
+- 同一存储下的重复安装使用共享锁与 HMAC 去重，窗口 5 秒、最多 256 项；只存指纹，不存原始载荷。空载荷或去重状态不可用时仍可能重复；窗口内无不同标识的合法相同事件也可能合并。
+- Linux `/proc` 祖先进程检查识别 `qoder` 或 `qoder-ide` 的实际宿主标签，不保存进程路径或环境值。事件支持范围仍由各自注册表决定。
+
+## 云端巡检（可选）
+
+默认只在本机采集与分析。仅在明确接受上传范围后，由部署环境注入下列变量；不要把凭据写入源码、配置示例、shell 历史或公开日志。
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `SYSOM_POP_ENDPOINT` | 必需，SysOM POP 网关地址 |
 | `SYSOM_ACCESS_KEY_ID` / `SYSOM_ACCESS_KEY_SECRET` | 必需，访问凭据 |
 | `SYSOM_SECURITY_TOKEN` | 可选，STS 临时凭据 |
 | `SYSOM_REGION_ID` | 可选，默认 `cn-hangzhou` |
 | `SYSOM_DEVICE_ID` | 可选，上报设备标识 |
-| `SYSOM_IDC_UPLOAD` | 设为 `0` / `false` / `no` / `off` 时显式关闭上传，即使凭据齐全也回到纯本地 |
+| `SYSOM_IDC_UPLOAD` | `0` / `false` / `no` / `off` 强制关闭上传 |
 
-凭据只从环境变量读取，不写入源码、配置文件、日志或响应；请由部署环境注入，避免写进 shell 历史或进程命令行。子进程环境默认只保留 `PATH`、`LANG`、`PYTHONDONTWRITEBYTECODE`，**仅在 `pre` 模式**才放行上表 `SYSOM_*` 白名单；`mock` 模式即使父环境存在 AK/SK 也不会传给 sysAK。
+sysAK 申请上传地址、上传快照并提交任务，云端生成报告；桌面／IDE 每 3 秒查询任务，最长等待 120 秒，再读取报告。上传包括本次资源、进程与检查证据，不包含 Agent 对话正文。
 
-上传内容与边界：
+有云端报告时，首页显示云端结论，“体检报告”打开总体级别、巡检项与实例计数、主机范围及逐项原因。云端正常／建议／警告／错误／严重来自后端规则，**不是本机评分**；“部分完成”不等于全部正常。
 
-- 上传的是本次 `idc_inspect` 采集的原始快照（资源用量、进程名/PID/starttime、体检证据等），不含 Agent 对话正文。接受主机级资源与进程信息上报后再启用。
-- 上传成功时 sysAK 把主报告 `request_id` 覆盖为 32 位十六进制 `inspection_id`；控制器据此启动步骤 5 轮询（3 秒间隔、120 秒超时），终态为 `completed` / `partial_completed` / `failed` / `expired` / `cancelled`，随后取一次报告。
-- 上传失败或凭据无效时回退本地 UUID，不把它当云端任务轮询；本地采集与展示照常，首页标记“云端巡检未完成”，`status.cloud_inspection.error` 给出原因。
-- 新采集会取代旧轮询；暂停采集或退出宿主会取消轮询。云端结果只保存在本进程内存，不形成持久化报告库。
-- 体检首页在本地结论后追加云端进度或“云端巡检结论：…”，“体检报告”按钮在有云端报告时打开云端报告弹窗（总体级别、巡检项与异常数、实例统计、逐项原因、主机/窗口/profile）；没有云端报告时仍是本地报告。
-- 公共只读 HTTP API 的 `GET` **永不触发采集或上传**；`cloud_inspection` 只作为已缓存状态在 `status` / `snapshot` 中透出，详见[本机 HTTP API](./docs/LOCAL-HTTP-API.md)。
+上传或查询失败保留本地结果并提示原因。云端结果只存在当前宿主进程内存，不提供历史报告库。公共 HTTP GET 只读已有缓存，永不触发上传或轮询。
 
-## Agent 采集与隐私
+## AgentSight 采集与隐私
 
-AgentSight API 与真实调用采集是两条独立链路。应用可复用已有本地 API，或从独立运行时准备缺失文件并以普通权限启动 API；启动 API 不会生成历史，也不会覆盖已有用户配置。
+AgentSight API 可复用已有本机部署，或由配套运行时准备缺失文件并以普通用户启动。启动 API 不生成调用历史，也不覆盖已有用户配置。
 
-**真实 eBPF 调用采集是明确授权的可选操作。** 理解并接受主机级采集风险后，才在产物目录执行：
+真实 eBPF 采集可能捕获主机进程的明文、参数与完整会话并本地保存，不能严格限定进程；敏感或多用户机器应保持关闭。`traceEnabled:false` 不代表历史内容脱敏。仅 trace 服务获得包括 `CAP_SYS_ADMIN` 在内的采集能力，API、GUI、IDE 不获得；回环地址不是多用户鉴权边界。
 
-```bash
-sh ./install-debs.sh --enable-agent-collection
-```
+**采集授权与核对：** 安装入口提供 `--enable-agent-collection` 授权选项。控制器发送 `idc --agent-collection {status|ensure|disable}` 兼容请求，root 辅助服务将其映射到固定 AgentSight 控制脚本，不由 `idc_inspect` 执行。实际采集仍依赖可信安装、普通用户授权、systemd、内核与 eBPF 能力；须核对服务状态和覆盖，不能仅凭安装或 API 连通宣称采集中。
 
-- 当前 AgentSight 不提供严格进程隔离，可能捕获其他主机进程的明文、参数和会话内容并本地保存；敏感或多用户机器建议保持关闭。
-- `traceEnabled:false` 不意味着已保存数据经过脱敏。不要公开数据库、令牌、完整配置或含敏感内容的日志。
-- 独立 trace 服务拥有包含 `CAP_SYS_ADMIN` 在内的采集能力；API、GUI、IDE 不获得这些能力。回环 API 地址本身不是多用户鉴权边界。
-- 主 deb 的 `sysom-idc.service` 是 root 辅助服务，只接受已授权 UID 的 AgentSight 采集控制请求；资源采集与受控进程操作已降到当前用户直接调用系统 sysAK，不经该服务。
-- 托管数据库合计 50 MiB 是周期性软清理目标，不是硬磁盘配额；停用采集不会删除历史。
-
-查看采集状态：
+配套运行时提供直接状态检查与停用入口；停用保留数据：
 
 ```bash
 sudo /usr/bin/python3 -I /usr/share/sysom/agentsight-runtime/agentsight-collection.py status
-```
-
-状态中的 `trace_running:true` 与 `api_running:true` 表示两条链路正在运行；仍需要可被捕获的真实调用才能形成历史。
-
-需要停用采集并保留历史时，再执行：
-
-```bash
 sudo /usr/bin/python3 -I /usr/share/sysom/agentsight-runtime/agentsight-collection.py disable
 ```
 
-自定义部署使用 `SYSOM_AGENTSIGHT_URL`（仅回环 HTTP/HTTPS）、`SYSOM_AGENTSIGHT_BIN`、`SYSOM_AGENTSIGHT_CONFIG`、`SYSOM_AGENTSIGHT_PACKAGE` 环境变量，文件路径需为绝对路径。鉴权使用 `SYSOM_AGENTSIGHT_TOKEN` 或已有密钥机制，不写入源码、README 或公开日志。已有显式配置优先，不会自动切换数据来源。
+托管数据库合计 50 MiB 是周期性软清理目标，不是硬配额；WAL、忙锁、空页可能使实际占用超过目标。专用数据目录为 `/var/lib/sysom-agentsight/<UID>`，专用 API 使用回环端口 7397。
 
-## 开发与测试
+自定义部署可用 `SYSOM_AGENTSIGHT_URL`（仅回环 HTTP/HTTPS）、`SYSOM_AGENTSIGHT_BIN`、`SYSOM_AGENTSIGHT_CONFIG`、`SYSOM_AGENTSIGHT_PACKAGE`；文件路径须为绝对路径。鉴权通过 `SYSOM_AGENTSIGHT_TOKEN` 或已有密钥机制提供。已有明确配置优先，勿公开令牌、完整配置或数据库。
 
-重新在包含 `package.json` 的项目根目录打开终端，再执行以下命令。
+## 本机只读查询
 
-### 网页预览与开发
+桌面与 IDE 各启动随机 `127.0.0.1` 端口，在宿主用户存储目录的 `local-api/<实例 UUID>.json` 写入私有发现文件。受信程序读取自己选定的实例，使用独立 Bearer token 访问；不硬编码端口、不打印 token、不从浏览器绕过 Origin 校验。
+
+提供状态、能力目录、一致快照、摘要、报告、17 个数据集的列表与详情，以及 OpenAPI 3.1 契约。数据集包含资源、排行、检查、GPU、AgentSight、Hook 事件与汇总、任务元数据。GET 只读宿主缓存，不重新读取 spool、不采集、不结束进程、不修改配置，也不代理任意内部路径。完整示例见[本机 HTTP API](./docs/LOCAL-HTTP-API.md)。
+
+## 从源码构建
+
+获取完整源码，在含根 `package.json` 的目录运行 `npm run build`。入口检查清单一致性，准备并校验 sysAK、AgentSight 与 GX 输入，安装子项目 npm 依赖，编译桌面与 IDE，并生成上述完整交付目录。请保留 `vendor/`、隐藏的 `.sysak_components/` 和本地 SDK tarball；无需 Git LFS 或子模块。
+
+```bash
+npm run build:desktop           # 三个 deb
+npm run build:ide               # VSIX
+npm run build:web               # 网页生产构建
+npm run build:qoder             # 两个静态 Hook ZIP
+npm run build -- --skip-install # 已具备依赖时使用
+npm run build -- --help
+```
+
+`npm run release` 与完整构建使用同一入口。构建使用已提供的原生输入，不重新编译完整上游 SysAK、AgentSight、GX 或 coolbpf；不生成 AppImage、不安装系统服务、不启用采集、不结束进程、不上传发布件。Electron 镜像可通过 `ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR` 指定，不修改全局配置。
+
+### 开发与检查
 
 ```bash
 npm run build:web
+npm run dev
 npm run preview
-```
-
-打开 `http://127.0.0.1:4173` 查看界面。网页预览不会安装原生服务，不等同于桌面端的完整本机诊断能力。
-
-完成 `build:web` 后，可执行 `npm run dev` 启动热更新服务，地址为 `http://127.0.0.1:5173`，不会启动 Electron。根目录 `dev` 等价于 `npm --prefix sysagent-idc run dev:web`；应用目录内的 `npm --prefix sysagent-idc run dev` 才会同时启动 Vite 与 Electron。
-
-**开发网页不是隔离的演示环境。** `sysagent-idc/demo-api.ts` 在 Vite 开发/预览服务上挂载 `/api/idc`，内部创建的是真实 `createIdcController`：默认调用系统 sysAK 采集，若环境提供了 SysOM 凭据还会真实上传。只做界面演示时请不要注入凭据，必要时用 `SYSOM_IDC_UPLOAD=0` 显式关闭上传。
-
-桌面开发需要完整安装桌面依赖并下载 Electron：先执行 `npm run build:desktop`，再在可用图形会话中执行 `npm --prefix sysagent-idc run dev`。
-
-### 回归测试
-
-```bash
-npm test                              # 根目录：构建流程与 GX 打包
-npm run test:api                      # 只读查询目录与本机 HTTP API
+npm test
+npm run test:api
 npm run check:versions
-npm --prefix sysagent-idc test        # 应用全量：采集/上传/控制器/UI/打包等
+npm --prefix sysagent-idc test
 ```
 
-根 `npm test` 只覆盖 `scripts/build.test.mjs` 与 `scripts/gx-package.test.cjs`；`test:api` 覆盖 `query-data` 与 `local-query-api`。迁移新增的 `sysom-client.test.cjs`（步骤 5 客户端与凭据白名单）、`cloud-report-ui.test.cjs`（云端报告渲染）以及 `idc-controller.test.cjs` 中的云巡检状态机用例都在应用目录的 `npm --prefix sysagent-idc test` 中，根入口不包含它们。这些测试使用注入的假替身，不触网、不安装系统服务、不发起真实采集或上传。
+`dev` 为网页热更新，`preview` 查看网页构建；桌面开发使用 `npm --prefix sysagent-idc run dev`。**开发网页挂载真实控制器，不是隔离演示：刷新会采集，有 SysOM 凭据会上传。** 仅查看 UI 时不要注入云凭据，必要时设 `SYSOM_IDC_UPLOAD=0`。
 
-应用全量测试有两个已知环境性问题：`health-score.test.cjs` 依赖未随仓库提供的历史对照夹具（`sysagent-analysis/port/c4-health-data.js`），会 ENOENT 失败；`sysak-package.test.cjs` 的 15 秒 `spawnSync` 上限在全量并发下偶发超时，单独运行可通过。两者都不代表采集或上传链路失败。
-
-此前在 Linux x64、Node.js 22.23.1 / npm 10.9.8 上记录过 49 项构建测试和 37 项查询/API 测试通过；该历史记录不等于 0.2.19 的完整构建验收。当前完整构建目标为三个 deb 与 VSIX，使用预编译输入，不是完整上游源码重编译；且受上文 SysAK 输入缺口影响，完整包构建尚未在缺口修复后重跑。
-
-历史验证不包含安装、图形界面或真实采集验收，也不证明依赖硬件与驱动的 GX GPU 跟踪可用。部分历史模块测试依赖未纳入仓库的参考夹具，不属于根目录测试范围；历史 Demo 发行脚本不是当前构建入口。
-
-### 目录与文档
-
-| 路径 | 内容 |
-| --- | --- |
-| [sysagent-idc/](./sysagent-idc/) | React / TypeScript 界面、Electron 桌面端及本地服务 |
-| [sysagent-idc/electron/idc-controller.cjs](./sysagent-idc/electron/idc-controller.cjs) | 采集调度、`idc_inspect` 调用、回环解析与云巡检状态机 |
-| [sysagent-idc/electron/sysom-client.cjs](./sysagent-idc/electron/sysom-client.cjs) | 步骤 5 只读客户端、凭据加载与子进程环境白名单 |
-| [sysagent-idc/src/CloudReport.tsx](./sysagent-idc/src/CloudReport.tsx) | 云端巡检报告弹窗与级别/状态标签 |
-| [sysagent-ide-extension/](./sysagent-ide-extension/) | IDE 插件与 Webview |
-| [scripts/build.mjs](./scripts/build.mjs) | 统一构建入口 |
-| [vendor/sysak/linux-x64/](./vendor/sysak/linux-x64/) | SysAK 构建输入与 manifest（当前为旧四命令包，需替换为含 `idc_inspect` 的输入） |
-| [vendor/agentsight/linux-x64/](./vendor/agentsight/linux-x64/) | AgentSight 二进制、manifest 与许可 |
-| [vendor/gx/linux-x64/](./vendor/gx/linux-x64/) | 官方未修改的 GX 0.6.5-2 deb 与 manifest |
-| [sysagent-idc/vendor/](./sysagent-idc/vendor/) | SysOM OpenAPI SDK tarball，供 `file:` 依赖离线安装 |
-| [scripts/coolbpf-gx-0.6.5-2.patch](./scripts/coolbpf-gx-0.6.5-2.patch) | 不含凭据的上游 coolbpf 限定范围补丁；非完整上游源码 |
-| [功能指南](./docs/FUNCTION-USER-GUIDE.md) | 功能与指标解释 |
-| [本机 HTTP API](./docs/LOCAL-HTTP-API.md) | 只读接口与第三方接入 |
-| [打包说明](./docs/PACKAGING.md) | 产物、安装脚本与历史批次记录 |
-| [IDC 设计](./docs/SYSAGENT-IDC-OPENAPI-DETAILED-DESIGN.md) | 资源采集与接口设计 |
+根测试、API 测试、应用测试的范围不同，不能互相替代。应用 `health-score` 测试依赖未随仓库提供的参考夹具，完整测试需先解决该依赖；不要伪造夹具或把失败视为通过。浏览器、原生运行和文档生成检查方法见[开发说明](./docs/DEVELOPMENT.md)。
 
 ## 常见问题
 
 | 问题 | 处理方式 |
 | --- | --- |
-| 构建提示 `Missing idc_inspect rule` / 缺少 SysAK 组件 | vendor SysAK 仍是旧四命令包；替换为含 `idc_inspect` 的构建输入并同步 manifest，见[已知构建缺口](#3-一键构建) |
-| 构建提示缺少 AgentSight / GX | 重新获取完整仓库，检查 vendor 子目录、manifest 和校验值，不以旧 deb 或本机缓存替代 |
-| Electron 下载失败 | 检查网络及镜像环境变量，成功安装依赖后才使用 `--skip-install` |
-| deb 依赖无法满足 | 核对 x64、glibc 与系统库；不要单装主 deb 或跳过依赖 |
-| 页面提示 `SYSAK_NOT_FOUND` / `SYSAK_COMPONENT_MISSING` | 由管理员安装含 `idc_inspect` 组件的系统 sysak 软件包；必要时用 `SYSOM_SYSAK_BIN` 指向可信绝对路径。不要以演示数据或旧私有 bundle 替代 |
-| AgentSight 配套安装件缺失 | 重新执行同批次 `install-debs.sh`，彻底退出客户端后重启 |
-| Agent 报告为空 | 检查 API 与真实采集状态；只有 API 可用不意味着已有历史 |
-| 资源不可用，但 Agent 报告可用 | 两条链路独立：先查系统 sysAK 与 `status.error`，再查 `systemctl status sysom-idc.service --no-pager` 和安装用户授权（该服务只影响 AgentSight 采集控制） |
-| 没有云端巡检结论 | 未配置凭据时 `status.mode` 为 `mock`，本来就不上传；已配置则看 `status.cloud_inspection` 的 `status`/`error`，上传失败或轮询超时都会保留本地结果 |
-| 端口、鉴权或配置错误 | 核对已有部署，不结束未知进程、不删除配置、不公开令牌 |
-| 修改源码后仍显示旧行为 | 重新构建、安装并退出旧客户端；只构建不会更新已安装程序 |
-| 缺少 GPU 页面或数据 | 取决于硬件、驱动和证据；虚拟显示设备不等于真实 GPU |
+| 提示未找到 sysAK 或缺少组件 | 安装完整系统 sysAK，或用 `SYSOM_SYSAK_BIN` 指向可信可执行文件；主 deb 不代装 |
+| Agent API 可用但没有会话 | 检查来源、时间窗口与真实采集状态；API 不产生调用历史 |
+| Hook 统计为 `—` | 核对插件启用、实际事件与安全存储；无来源不能当成零 |
+| 累计事件很多，但明细少 | 累计独立保存；近 24h 明细与轮转有界，筛选只作用于最新列表 |
+| 能耗没有进程数据 | 进程样本或同窗 CPU 数据不足时无法估算，不当作零功率 |
+| 本机高分但云端严重 | 两者规则与证据不同，应看项级原因，不互相替代 |
+| GPU 资源有值但诊断不可用 | 核对硬件、驱动和执行状态；传感器与 GX 原生诊断是独立能力 |
+| GET 后数据不变 | 查询只读缓存；在界面刷新或等待已配置巡检 |
+| 端口或鉴权异常 | 重新发现自己的活跃实例；不结束未知进程、不删除配置、不公开凭据 |
+| 关闭主页后应用仍在 | 主页收起为小管家，右键“退出”彻底退出 |
 
-反馈问题时请提供系统、Node/npm 或 IDE 版本、构建命令和脱敏错误信息，不附带令牌、私人配置、数据库或真实会话内容。
+反馈时提供系统、宿主、命令与脱敏错误信息，不附私人配置、数据库、令牌或会话内容。
 
-## 源码交付与许可
+## 源码与许可
 
-**构建输入（含官方未修改的 GX deb）随源码提供，SysAgent 生成安装包单独分发：**
+| 目录 | 职责 |
+| --- | --- |
+| `sysagent-idc/` | 共享 React 页面、Electron、采集控制器、内部分析与本机查询 |
+| `sysagent-ide-extension/` | IDE 宿主、Webview、状态栏与报告保存 |
+| `plugins/qoder/` / `plugins/qoder-ide/` | 两种宿主的 Hook 注册与插件入口 |
+| `sysagent-agent-hooks/` | 共享 Python 元数据运行时、累计存储与 adapter |
+| `scripts/` | 统一构建、清单同步、原生输入校验与 Hook ZIP 打包 |
+| `vendor/` | SysAK、AgentSight 与官方未修改的 GX 构建输入及清单 |
+| `sysagent-idc/vendor/` | SysOM SDK 本地依赖包 |
+| `docs/` | 使用、对接、开发与打包文档 |
 
-- `vendor/sysak/linux-x64/` 全部 **25 个文件**随源码提交：包括 `sysak`、隐藏的 `.sysak_components/` 及其中的原生/Python 组件、规则和配置，以及 `manifest.json`。**当前提交的仍是旧四命令包（`idc` / `resource_anomaly` / `memgraph` / `ai`）**；运行时与打包校验要求 `idc_inspect`，替换输入时必须同步 manifest 的 `commands`、`safe_profiles` 与逐文件哈希。
-- `vendor/agentsight/linux-x64/` 全部 **3 个文件**随源码提交：`agentsight`、`manifest.json`、`LICENSE`。不能只提交 manifest 或让二进制留在本机未跟踪目录。
-- `vendor/gx/linux-x64/` 全部 **2 个文件**随源码提供：官方未修改的 `gx_0.6.5-2_amd64.deb` 和 `manifest.json`。该 deb 来自 SysAK AI 上游构建输入，包元数据为 `gx` / `0.6.5-2` / `amd64`，维护者为 `alibaba-cloud`；原样再分发，不分发获取时的签名 URL 或签名参数。
-- 共 **30 项必要 vendor 输入**（25 + 3 + 2）不被 `.gitignore` 排除，无需 Git LFS。更新输入时同步 manifest，并验证完整构建；不要遗漏隐藏组件。
-- `sysagent-idc/vendor/alicloud-sysom20231230-3.3.2.tgz` 是步骤 5 使用的 SysOM OpenAPI SDK 离线包，`sysagent-idc/package.json` 以 `file:` 依赖引用，随源码提交，`npm ci` 不需要访问公共 npm 获取该包。SDK 及其依赖遵循自身许可。
-- GX deb 的 SHA-256：`a471bf61863c61744b102ba19a8620feea68d9aeaab8591c9d056f3cbe5b1902`；构建时校验 manifest 与文件哈希，复制到产物目录时不修改包。
-- `scripts/coolbpf-gx-0.6.5-2.patch` 保留限定范围的上游 coolbpf 改动：GX 版本/已配置状态检查、包缓存与哈希验证。补丁不含凭据或签名 URL；完整上游源码未随仓库提供，补丁不代表完整对应源码交付，根构建入口不据此重新编译完整上游项目。
-- `sysagent-idc/resources/sysak/` 从 vendor 安全生成，不作为源码输入提交。
-- `release/` 及子项目 `release/` 是生成安装包目录，保持 Git 忽略；通过项目发布资产渠道单独分发。依赖、编译输出、私人配置、数据库和开发缓存同样不提交。
+二进制、隐藏组件、规则、manifest 和许可必须完整保留；不能只保留清单或用私人配置替代构建输入。生成的私有 bundle、依赖、缓存与交付目录不作为源码输入。
 
-维护者提交源码时可显式加入并核对完整输入：
-
-```bash
-git add -- vendor/sysak/linux-x64 vendor/agentsight/linux-x64 vendor/gx/linux-x64 scripts/coolbpf-gx-0.6.5-2.patch sysagent-idc/vendor/alicloud-sysom20231230-3.3.2.tgz
-git ls-files -- vendor/sysak/linux-x64 vendor/agentsight/linux-x64 vendor/gx/linux-x64 scripts/coolbpf-gx-0.6.5-2.patch sysagent-idc/vendor
-```
-
-SysAgent 原创代码采用 [MIT](./LICENSE)。SysAK、AgentSight、GX、Electron、字体等第三方组件及上游 coolbpf 补丁所涉及的源文件遵循自身许可，不因项目 MIT 而重新授权；分发时保留 [THIRD_PARTY_NOTICES](./THIRD_PARTY_NOTICES)、[FONT_LICENSE](./FONT_LICENSE) 和 [AgentSight LICENSE](./vendor/agentsight/linux-x64/LICENSE)。参考 UI 与素材的来源和授权说明见第三方声明。
-
-已获用户授权公开再分发官方未修改的 GX deb；这是分发操作授权，不是对上游许可的替代或新许可授予。已检查的 GX RPM 元数据许可字段原文为 `LBPLv2+` 和 `MIT`，不将前者擅自更正或据此认定整个 GX 为 MIT；已检查的 GX deb 缺少完整的 copyright/license 文件。不能因文件缺失推断 GX 为专有软件，也不能用 SysAgent 的 MIT 为 GX 或上游源代码重新授权。保留上游版权和许可信息，适用的通知及对应源码义务仍需依据上游实际许可确认；原样分发和本地补丁不消除这些义务。
+原创代码采用 [MIT](./LICENSE)。SysAK、AgentSight、GX、Electron、字体与其他第三方组件遵循各自许可，SysAgent 的 MIT 不重新授权它们。分发时保留 [THIRD_PARTY_NOTICES](./THIRD_PARTY_NOTICES)、[FONT_LICENSE](./FONT_LICENSE) 与 [AgentSight LICENSE](./vendor/agentsight/linux-x64/LICENSE)。GX deb 原样再分发；其许可通知与对应源码义务需按上游实际许可核对，不能因 deb 缺少完整许可文件而推断整个 GX 为 MIT。

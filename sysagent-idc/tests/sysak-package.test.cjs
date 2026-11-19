@@ -6,6 +6,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const previousStateHome = process.env.XDG_STATE_HOME;
+const scratchStateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'sysagent-package-test-state-'));
+process.env.XDG_STATE_HOME = scratchStateHome;
+require('node:test').after(() => {
+  if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = previousStateHome;
+  fs.rmSync(scratchStateHome, { recursive: true, force: true });
+});
 const {
   prepareBundle, verifyBundle, validateElf, normalizeRules, parseArgs, sha256,
   REQUIRED_FILES, TOOLS: ACTUAL_TOOLS, RULES: ACTUAL_RULES,
@@ -1911,6 +1919,70 @@ test('installer rejects a symlinked deployment ancestor before any resource chmo
   assert.deepEqual(installed.chownCalls(), []);
   assert.deepEqual(modeSnapshot(f.temporary), before);
 });
+
+const HOOK_MODULES = ['__init__', 'event', 'spool', 'history'];
+function openApiBuildFixture(t) {
+  const temporary = fs.mkdtempSync(path.join(scratchStateHome, 'openapi-build-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const projectRoot = path.join(temporary, 'sysagent-idc');
+  const source = path.join(temporary, 'sysagent-agent-hooks', 'sysagent_hooks');
+  const script = path.join(projectRoot, 'scripts', 'build-openapi.cjs');
+  write(script, fs.readFileSync(path.join(ROOT, 'scripts', 'build-openapi.cjs')));
+  fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(projectRoot, 'node_modules'), 'dir');
+  fs.mkdirSync(path.join(projectRoot, 'electron'), { mode: 0o755 });
+  // buildOpenApi now depends on the same canonical Python inputs as the real app/IDE build.
+  for (const name of HOOK_MODULES) write(path.join(source, `${name}.py`),
+    fs.readFileSync(path.resolve(ROOT, '../sysagent-agent-hooks/sysagent_hooks', `${name}.py`)));
+  const service = path.join(projectRoot, 'openapi-service.ts');
+  const contract = path.join(projectRoot, 'openapi-contract.json');
+  write(service, "import contract from './openapi-contract.json'; export { contract };\n");
+  write(contract, JSON.stringify({ schema_version: 'fixture-only', sentinel: 'embedded-contract' }));
+  const generated = path.join(projectRoot, 'electron', 'generated');
+  return { temporary, projectRoot, source, service, contract, generated, ...require(script) };
+}
+
+test('OpenAPI fixture builds embedded JSON plus exactly four byte-exact allowlisted Hook sources, ignoring private extras', async t => {
+  const f = openApiBuildFixture(t);
+  for (const relative of ['adapter.py', 'private.py', '.env', 'credentials.json', '__pycache__/history.pyc']) {
+    write(path.join(f.source, relative), 'private-extra-must-not-be-bundled');
+  }
+  fs.symlinkSync(path.join(f.temporary, 'missing-private-target'), path.join(f.source, 'excluded-symlink.py'));
+  const before = snapshot(f.source);
+  await f.buildOpenApi();
+  assert.deepEqual(fileList(f.generated), ['hook-runtime.cjs', 'openapi.cjs']);
+  const runtime = require(path.join(f.generated, 'hook-runtime.cjs'));
+  assert.deepEqual(Object.keys(runtime).sort(), [...HOOK_MODULES].sort());
+  for (const name of HOOK_MODULES) assert.deepEqual(Buffer.from(runtime[name], 'utf8'), fs.readFileSync(path.join(f.source, `${name}.py`)), name);
+  assert.doesNotMatch(fs.readFileSync(path.join(f.generated, 'hook-runtime.cjs'), 'utf8'), /private-extra-must-not-be-bundled/);
+  assert.deepEqual(require(path.join(f.generated, 'openapi.cjs')).contract, { schema_version: 'fixture-only', sentinel: 'embedded-contract' });
+  const output = snapshot(f.generated);
+  f.buildHookRuntime();
+  await f.buildOpenApi();
+  assert.deepEqual(snapshot(f.generated), output);
+  assert.deepEqual(snapshot(f.source), before, 'Canonical Python inputs and excluded files remain untouched');
+});
+
+for (const name of HOOK_MODULES) {
+  test(`OpenAPI build still rejects missing canonical Hook input without replacing previous outputs: ${name}.py`, async t => {
+    const f = openApiBuildFixture(t);
+    await f.buildOpenApi();
+    const before = snapshot(f.generated);
+    fs.unlinkSync(path.join(f.source, `${name}.py`));
+    await assert.rejects(f.buildOpenApi(), /ENOENT/);
+    assert.deepEqual(snapshot(f.generated), before);
+  });
+}
+
+for (const missing of ['service', 'contract']) {
+  test(`OpenAPI fixture preserves missing-${missing} rejection once canonical Python inputs are supplied`, async t => {
+    const f = openApiBuildFixture(t);
+    await f.buildOpenApi();
+    const before = snapshot(f.generated);
+    fs.unlinkSync(f[missing]);
+    await assert.rejects(f.buildOpenApi(), /Missing openapi-(?:service\.ts|contract\.json)/);
+    assert.deepEqual(snapshot(f.generated), before);
+  });
+}
 
 test('OpenAPI build uses installed esbuild, Node20 CJS, embedded JSON and existing runtime output inclusion', () => {
   const script = fs.readFileSync(path.join(ROOT, 'scripts/build-openapi.cjs'), 'utf8');

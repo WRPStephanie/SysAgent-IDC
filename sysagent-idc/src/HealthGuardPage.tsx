@@ -2,13 +2,13 @@ import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { Activity, ArrowDownToLine, ArrowLeft, ArrowRight, Blocks, Check, ChevronRight, Clock3, Cpu, FileText, FolderRoot, Gauge, HardDrive, Info, ListChecks, LoaderCircle, MemoryStick, Network, RefreshCw, Settings2, ShieldCheck, Sparkles, Trash2, TriangleAlert, Zap, type LucideIcon } from 'lucide-react';
 import type { Device, PageId } from './data';
 import { MascotLogo, Modal } from './components';
-import { AgentOverviewCards } from './AgentOverviewCards';
+import { AgentOverviewCards, HomeAgentStatistics } from './AgentOverviewCards';
 import { ResourceRankings } from './ResourceRankings';
 import { HealthPerformance } from './HealthPerformance';
 import { CollectionStatus } from './CollectionStatus';
 import { CloudReportModal, cloudActive, cloudStatusLabels, itemNameLabels, levelLabels, levelRank } from './CloudReport';
 import { localTime } from '../agent-diagnostics';
-import { collectedRankingRows, inspectionResultLabel, buildHealthReport, formatResourceValue, formatResourceQuantity, inspectionScope, scoreBand, stateResourceIds, summarizeHealth, type HealthState, type Inspection, type ResourceId } from './health-data';
+import { collectedRankingRows, inspectionResultLabel, buildHealthReport, formatResourceValue, formatResourceQuantity, powerMethodLabel, inspectionScope, scoreBand, stateResourceIds, summarizeHealth, type HealthState, type Inspection, type ResourceId } from './health-data';
 import { cleanupAgentSessions, cleanupResources, executeProcessCleanup, prepareProcessCleanup, optimizeHealth, runHealthInspection, fetchCollectorStatus } from './health-api';
 import type { CloudInspectionReport, CollectorStatus, ProcessCleanupPlan, ProcessCleanupResult } from './idc-client';
 export type RefreshHealthSnapshot = (refresh?: boolean) => Promise<HealthState>;
@@ -17,6 +17,7 @@ export interface HealthReportContentProps {
   state: HealthState;
 }
 export interface HealthGuardPageProps extends HealthReportContentProps {
+  agentLive: boolean;
   loading: boolean;
   loadError: string;
   onRefresh: RefreshHealthSnapshot;
@@ -223,6 +224,7 @@ function cloudConclusion(report: CloudInspectionReport): string {
 export function HealthGuardPage({
   device,
   state,
+  agentLive,
   loading,
   loadError,
   onRefresh,
@@ -239,6 +241,7 @@ export function HealthGuardPage({
   const [inspectionListOpen, setInspectionListOpen] = useState(false);
   const [returnToInspectionList, setReturnToInspectionList] = useState(false);
   const [agentOnly, setAgentOnly] = useState(false);
+  const [rankingQuery, setRankingQuery] = useState('');
   const [reportOpen, setReportOpen] = useState(false);
   const [scoreRulesOpen, setScoreRulesOpen] = useState(false);
   const [performanceOpen, setPerformanceOpen] = useState(false);
@@ -273,7 +276,7 @@ export function HealthGuardPage({
   const busy = operationPhase !== "idle" || loading || externalBusy;
   const blocked = busy || refreshRequired || !!loadError || !collectorEnabled;
   const resource = selectedResource ? state.resources[selectedResource] : null;
-  const selectedRows = (resource ? collected ? collectedRankingRows(resource, agentOnly) : resource.rows.slice(0, 10) : []).filter(item => item.cleanable && selectedRowIds.includes(item.id));
+  const selectedRows = (resource ? collected ? collectedRankingRows(resource, agentOnly, rankingQuery) : resource.rows.slice(0, 10) : []).filter(item => item.cleanable && selectedRowIds.includes(item.id));
   const selectedOptimizations = state.optimizations.filter(item => selectedOptimizationIds.includes(item.id));
   const inspection = state.inspections.find(item => item.id === selectedInspectionId);
   const inspectionCounts = {
@@ -301,7 +304,8 @@ export function HealthGuardPage({
     setCleanupPlan(null);
     setProcessResults([]);
     setAgentOnly(false);
-    setSelectedRowIds(state.resources[resourceId].rows.slice(0, 10).filter(entry => entry.cleanable && entry.defaultSelected).map(entry => entry.id));
+    setRankingQuery('');
+    setSelectedRowIds((collected ? collectedRankingRows(state.resources[resourceId], false) : state.resources[resourceId].rows.slice(0, 10)).filter(entry => entry.cleanable && entry.defaultSelected).map(entry => entry.id));
     setOperationError("");
     setOperationSuccess("");
   }
@@ -682,7 +686,7 @@ export function HealthGuardPage({
       </div>
     </section>
     {!selectedResource && !optimizationOpen && operationStatus}
-    {!collected && <AgentOverviewCards
+    {agentLive ? <HomeAgentStatistics onOpen={() => onNavigate('agents')} /> : <AgentOverviewCards
       recovered={agentsRecovered}
       disabled={busy}
       onOpen={() => onNavigate("agents")}
@@ -753,11 +757,11 @@ export function HealthGuardPage({
                   {"整机"}
                 </small>}
                 {resourceId === "energy" && <small>
-                  {collected ? '功率测量' : '预算占比 · 估算'}
+                  {collected ? powerMethodLabel(snapshot) : '预算占比 · 估算'}
                 </small>}
               </h3>
               <span className={exceeded ? "sh-limit abnormal" : "sh-limit"}>
-                {snapshot.status === 'unavailable' ? '不可用' : snapshot.status === 'partial' ? '部分采集' : hasPercent ? exceeded ? '超过 90%' : '未超限' : snapshot.quantity?.unit === 'W' ? '实测功率' : '不可用'}
+                {snapshot.status === 'unavailable' ? '不可用' : snapshot.status === 'partial' ? resourceId === 'energy' ? '部分覆盖' : '部分采集' : hasPercent ? exceeded ? '超过 90%' : '未超限' : snapshot.quantity?.unit === 'W' ? state.hasGpu ? 'CPU + GPU' : 'CPU' : '不可用'}
               </span>
             </div>
             <div className="sh-resource-body">
@@ -885,7 +889,7 @@ export function HealthGuardPage({
     <div className="sh-bottom-note">
       <Info size={14} />
       <span>
-        {collected ? '系统资源与进程排行来自只读采集；支持当前用户非受保护进程的确认结束和 Agent 白名单筛选，不提供 Session 归属、文件清理或自动修复。能耗仅显示实测功率或不可用，GPU 缺少测量不代表正常。' : `清理与优化通过模拟解析接口更新展示数据：Session 清理在 CPU、能耗、内存${state.hasGpu ? "和 GPU " : ""}间同步释放运行资源，磁盘中按 Session 删除其数据文件。能耗按预算占比估算；接口成功后统一刷新，不操作真实文件或任务。`}
+        {collected ? '资源来自只读采集；进程结束需确认，不提供 Session 归属、文件清理或自动修复。' : `清理与优化通过模拟解析接口更新展示数据：Session 清理在 CPU、能耗、内存${state.hasGpu ? "和 GPU " : ""}间同步释放运行资源，磁盘中按 Session 删除其数据文件。能耗按预算占比估算；接口成功后统一刷新，不操作真实文件或任务。`}
       </span>
     </div>
     {resource && <Modal
@@ -904,11 +908,11 @@ export function HealthGuardPage({
             </strong>
             <span>
               {resource.label}
-              {" · 最新整体占用"}
+              {collected && resource.id === 'energy' ? ' · 当前功率' : ' · 最新整体占用'}
             </span>
           </div>
           <p>
-            {collected ? `${formatResourceQuantity(resource)} · ${resource.note || '当前采集范围，排行不等于整机占用总和。'}` : agentOnly ? resource.id === "disk" ? "已筛选 Agent 相关数据：展开 Agent 查看各 Session 占用的工作目录、缓存与中间结果，运行中会话的数据受保护。" : "已筛选 Agent 相关进程：展开 Agent 查看 Session，空闲或已完成的会话可勾选清理，运行中会话受保护。" : resource.id === "energy" ? "能耗以预算占比展示，按程序及 Session 分摊，仅为 Demo 估算，非实测能耗。" : "Agent 应用可继续展开 Session；运行中会话受保护，空闲或完成的会话可按需清理。"}
+            {collected ? resource.id === 'energy' ? formatResourceQuantity(resource) : `${formatResourceQuantity(resource)} · ${resource.note || '当前采集范围，排行不等于整机占用总和。'}` : agentOnly ? resource.id === "disk" ? "已筛选 Agent 相关数据：展开 Agent 查看各 Session 占用的工作目录、缓存与中间结果，运行中会话的数据受保护。" : "已筛选 Agent 相关进程：展开 Agent 查看 Session，空闲或已完成的会话可勾选清理，运行中会话受保护。" : resource.id === "energy" ? "能耗以预算占比展示，按程序及 Session 分摊，仅为 Demo 估算，非实测能耗。" : "Agent 应用可继续展开 Session；运行中会话受保护，空闲或完成的会话可按需清理。"}
           </p>
         </div>
         <ResourceRankings
@@ -925,11 +929,13 @@ export function HealthGuardPage({
           })}
           agentOnly={agentOnly}
           onAgentOnlyChange={value => { setAgentOnly(value); setSelectedRowIds([]); setCleanupPlan(null); }}
+          query={rankingQuery}
+          onQueryChange={value => { setRankingQuery(value); setSelectedRowIds([]); setCleanupPlan(null); }}
           key={resource.id}
         />
         <div className="sh-notice">
           <Info size={14} />
-          {collected ? '排行仅为已采集范围。清理会请求结束整个进程，可能中断任务；不会删除磁盘文件或清理 Agent Session。' : '清理仅作用于选中的 Demo 对象。真实进程回收可能中断任务，真实删除不一定可恢复。'}
+          {collected ? '排行仅为已采集范围。清理会请求结束整个进程，可能中断任务；不会删除磁盘文件、历史统计或清理 Agent Session。' : '清理仅作用于选中的 Demo 对象。真实进程回收可能中断任务，真实删除不一定可恢复。'}
         </div>
         {operationStatus}
         {collected && <>

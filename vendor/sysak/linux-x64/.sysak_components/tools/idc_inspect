@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MulanPSL-2.0
+"""sysak idc_inspect - host inspection facts as JSON, plus bounded process API.
+
+默认采集 schema 1.1 事实，不做判定；CPU/内存/磁盘/fd/进程等阈值规则全部在服务端
+inspection_agent 执行。原 sysak idc 的能力并入本命令：`--profile` 走 schema 1.0
+envelope 采集，`--process-action` 走受限 pidfd 进程接口，两者的输出契约与参数
+语义保持不变。
+"""
+
+# rpm 的 brp-python-bytecompile 会用 Python 2.7 做语法检查（不执行），
+# 保持 print(file=...) 在 2.7 下可解析。
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import platform
+import socket
+import sys
+import tempfile
+import time
+import uuid
+
+import schema
+from common import runner as exec_helper
+from common import procfs, stat
+from common.budget import (Deadline, HardTimeout, HardTimeoutGuard,
+                           utc_now_iso)
+from sections import (config, cpu, cgroup, disk, energy, fd, gpu, host, io, jbd,
+                      kernel, log, memory, network, process, psi, service,
+                      stacks)
+
+# 原 sysak idc 的入口标记，出现时整个 argv 交给 idc_compat，保持旧参数语义。
+COMPAT_FLAGS = ("--profile", "--process-action")
+
+SECTION_MODULES = {
+    "host": host,
+    "cpu": cpu,
+    "memory": memory,
+    "psi": psi,
+    "disk": disk,
+    "fd": fd,
+    "network": network,
+    "process": process,
+    "io": io,
+    "energy": energy,
+    "gpu": gpu,
+    "log": log,
+    "service": service,
+    "config": config,
+    "cgroup": cgroup,
+    "kernel": kernel,
+    "stacks": stacks,
+    "jbd": jbd,
+}
+
+
+class Context(object):
+    def __init__(self, request_id, sample_ms=1000, topn=10, max_pids=4096,
+                 timeout=30.0, proc_root="/proc", sys_root="/sys",
+                 fs_root="/", clock=None, sleep=None, wall=None,
+                 runner=None, which=None, sysconf=None, device=None,
+                 deep=False, kmsg_path=None, mounts_path=None):
+        self.request_id = request_id
+        self.sample_ms = int(sample_ms)
+        self.topn = int(topn)
+        self.max_pids = int(max_pids)
+        self.timeout = float(timeout)
+        self.proc_root = str(proc_root)
+        self.sys_root = str(sys_root)
+        self.fs_root = str(fs_root)
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.wall = wall or time.time
+        self.runner = runner or exec_helper.run
+        self.which = which or exec_helper.which
+        self.sysconf = sysconf or os.sysconf
+        self.deep = bool(deep)
+        self.kmsg_path = kmsg_path
+        self.mounts_path = mounts_path
+        self.deadline = Deadline(self.timeout * 0.8, clock=self.clock)
+        self.nproc = self._nproc()
+        self.hz = self._hz()
+        self.collected_at = utc_now_iso(self.wall)
+        self.started_clock = self.clock()
+        self.device = device or {
+            "platform": platform.system(),
+            "machine": platform.machine(),
+            "hostname": socket.gethostname(),
+            "scope": "local",
+        }
+        self.requested = list(schema.P0_SECTIONS)
+        self.skipped_sections = []
+        self._report = None
+
+    def _nproc(self):
+        try:
+            value = self.sysconf("SC_NPROCESSORS_ONLN")
+            if value and value > 0:
+                return int(value)
+        except (ValueError, OSError, AttributeError):
+            pass
+        return 0
+
+    def _hz(self):
+        try:
+            value = self.sysconf("SC_CLK_TCK")
+            if value and value > 0:
+                return int(value)
+        except (ValueError, OSError, AttributeError):
+            pass
+        return 100
+
+
+def section_plan(args):
+    """返回 (requested, skipped)。
+
+    P0 只请求轻量 section；cgroup/kernel 属于 P1，stacks/jbd/cgroup_conn
+    属于重采集，未显式启用时只记入覆盖率缺口。
+    """
+    disabled = set()
+    if args.no_gpu:
+        disabled.add("gpu")
+    if args.no_log:
+        disabled.add("log")
+    if args.no_service:
+        disabled.add("service")
+    requested = [name for name in schema.P0_SECTIONS if name not in disabled]
+    if args.enable_stacks or args.deep:
+        requested.append("stacks")
+    if args.enable_jbd or args.deep:
+        requested.append("jbd")
+    skipped = [name for name in schema.HEAVY_SECTIONS
+               if name not in requested]
+    return requested, skipped
+
+
+def _empty_collection(ctx):
+    started = ctx.collected_at
+    return {
+        "profile": "inspection",
+        "started_at": started,
+        "finished_at": started,
+        "duration_ms": 0,
+        "status": schema.STATUS_PARTIAL,
+        "sample_window_ms": ctx.sample_ms,
+        "budget_ms": int(round(ctx.timeout * 0.8 * 1000)),
+        "truncated": False,
+        "sections": {},
+        "coverage": {
+            "requested": list(ctx.requested),
+            "completed": [],
+            "partial": [],
+            "skipped": [],
+            "failed": [],
+        },
+    }
+
+
+def new_report(ctx):
+    device = dict(ctx.device)
+    return {
+        "schema_version": schema.SCHEMA_VERSION,
+        "request_id": ctx.request_id,
+        "collector": {
+            "name": schema.COLLECTOR_NAME,
+            "command": schema.COLLECTOR_COMMAND,
+            "version": schema.COLLECTOR_VERSION,
+        },
+        "device": device,
+        "host": {},
+        "collection": _empty_collection(ctx),
+        "sections": {},
+        "limits": {
+            "max_processes": ctx.max_pids,
+            "top_n": ctx.topn,
+            "max_log_hits": schema.MAX_LOG_HITS,
+            "max_json_bytes": schema.MAX_JSON_BYTES,
+        },
+        "capabilities": {
+            "read_only": True,
+            "supported_profiles": ["inspection"],
+            "unsupported_actions": ["cleanup", "optimize", "process-kill"],
+        },
+    }
+
+
+def _placeholders(report, ctx):
+    for name in ctx.requested:
+        report["collection"]["sections"][name] = {
+            "status": schema.STATUS_TIMEOUT,
+            "reason": schema.REASON_DEADLINE_EXCEEDED,
+            "detail": "not collected",
+        }
+
+
+def _sanitize_result(result):
+    result, nonfinite, clamped = schema.sanitize(result)
+    if nonfinite:
+        result["status"] = schema.STATUS_PARTIAL
+        result["reason"] = schema.REASON_PARSE_ERROR
+        result["detail"] = "non-finite values replaced"
+        result["parse_errors"] = int(result.get("parse_errors", 0)) + nonfinite
+    if clamped:
+        result["truncated"] = True
+        if result.get("status") == schema.STATUS_OK:
+            result["status"] = schema.STATUS_PARTIAL
+            result["reason"] = schema.REASON_TOTAL_JSON_LIMIT
+            result["detail"] = "integer values clamped to JSON safe range"
+    return result
+
+
+def run_section(report, ctx, name, function, *args, **kwargs):
+    try:
+        result = function(ctx, *args, **kwargs)
+    except HardTimeout:
+        raise
+    except Exception:
+        result = schema.section(
+            status=schema.STATUS_ERROR,
+            reason=schema.REASON_PARSE_ERROR,
+            detail="section failed",
+        )
+    result = _sanitize_result(schema.normalize(result))
+    if name == "host":
+        report["host"] = result
+    else:
+        report["sections"][name] = result
+    report["collection"]["sections"][name] = {
+        "status": result["status"],
+        "reason": result["reason"],
+        "detail": result["detail"],
+    }
+    return result
+
+
+def sample_counters(ctx):
+    out = {}
+    for name, relative, parser in (
+            ("cpu", "stat", stat.parse_cpu_stat),
+            ("disk", "diskstats", stat.parse_diskstats),
+            ("net", os.path.join("net", "dev"), stat.parse_net_dev)):
+        ts = ctx.clock()
+        text = procfs.read_text(os.path.join(ctx.proc_root, relative),
+                                default="")
+        out[name] = {"ts": ts, "data": parser(text)}
+    return out
+
+
+def _wait_window(ctx, pre):
+    try:
+        target = float(pre["cpu"]["ts"]) + ctx.sample_ms / 1000.0
+    except (KeyError, TypeError, ValueError):
+        return
+    remaining = target - ctx.clock()
+    if remaining <= 0:
+        return
+    budget = ctx.deadline.remaining()
+    if budget <= 0:
+        ctx.deadline.truncated = True
+        return
+    if budget < remaining:
+        ctx.deadline.truncated = True
+    try:
+        ctx.sleep(min(remaining, budget))
+    except OSError:
+        pass
+
+
+def collect(ctx, compact=False):
+    report = new_report(ctx)
+    ctx._report = report
+    _placeholders(report, ctx)
+
+    host_result = run_section(report, ctx, "host", host.collect)
+    report["device"]["hostname"] = host_result.get("hostname") or \
+        report["device"].get("hostname", "")
+
+    pre = sample_counters(ctx)
+    pre["energy"] = energy.sample(ctx)
+    pids = procfs.list_pids(ctx.proc_root, limit=ctx.max_pids)
+    pre["process"] = process.sample(ctx, pids=pids)
+    pre["io"] = io.sample(ctx, pids=pids, tasks=pre["process"]["tasks"])
+
+    _wait_window(ctx, pre)
+
+    post = sample_counters(ctx)
+    post["energy"] = energy.sample(ctx)
+    post["process"] = process.sample(ctx)
+    post["io"] = io.sample(ctx, pids=pids, tasks=post["process"]["tasks"])
+
+    run_section(report, ctx, "cpu", cpu.collect, pre["cpu"], post["cpu"])
+    run_section(report, ctx, "memory", memory.collect)
+    run_section(report, ctx, "psi", psi.collect)
+    run_section(report, ctx, "disk", disk.collect, pre["disk"], post["disk"])
+    run_section(report, ctx, "fd", fd.collect)
+    run_section(report, ctx, "network", network.collect, pre["net"], post["net"])
+    run_section(report, ctx, "process", process.collect, pre["process"],
+                post["process"])
+    run_section(report, ctx, "io", io.collect, pre["io"], post["io"])
+    run_section(report, ctx, "energy", energy.collect, pre["energy"],
+                post["energy"])
+
+    log_result = None
+    if "log" in ctx.requested:
+        log_result = run_section(report, ctx, "log", log.collect)
+    if "gpu" in ctx.requested:
+        run_section(report, ctx, "gpu", gpu.collect, log_result)
+    if "service" in ctx.requested:
+        run_section(report, ctx, "service", service.collect)
+    if "config" in ctx.requested:
+        run_section(report, ctx, "config", config.collect)
+    for name in ("stacks", "jbd"):
+        if name in ctx.requested:
+            run_section(report, ctx, name, SECTION_MODULES[name].collect)
+
+    finalize(report, ctx, compact=compact)
+    return report
+
+
+BAD_STATUSES = (schema.STATUS_UNAVAILABLE, schema.STATUS_PERMISSION_DENIED,
+                schema.STATUS_TIMEOUT, schema.STATUS_ERROR,
+                schema.STATUS_SKIPPED)
+
+
+def _collection_status(report, ctx):
+    sections = report["collection"]["sections"]
+    statuses = {}
+    for name in ctx.requested:
+        statuses[name] = sections.get(name, {}).get(
+            "status", schema.STATUS_TIMEOUT)
+    host_status = statuses.get("host")
+    if host_status in (schema.STATUS_UNAVAILABLE, schema.STATUS_TIMEOUT,
+                       schema.STATUS_ERROR):
+        return "failed"
+    core = [statuses.get(name) for name in schema.CORE_SECTIONS]
+    if all(status in BAD_STATUSES for status in core):
+        return "failed"
+    if all(status == schema.STATUS_OK for status in statuses.values()) and \
+            not report["collection"]["truncated"]:
+        return schema.STATUS_OK
+    return schema.STATUS_PARTIAL
+
+
+def _coverage(report, ctx):
+    sections = report["collection"]["sections"]
+    requested = list(ctx.requested)
+    completed = []
+    partial = []
+    failed = []
+    skipped = []
+    for name in requested:
+        status = sections.get(name, {}).get("status", schema.STATUS_TIMEOUT)
+        if status == schema.STATUS_OK:
+            completed.append(name)
+        elif status == schema.STATUS_PARTIAL:
+            partial.append(name)
+        elif status in (schema.STATUS_SKIPPED, schema.STATUS_UNAVAILABLE):
+            skipped.append(name)
+        else:
+            failed.append(name)
+    for name in ctx.skipped_sections:
+        if name not in skipped:
+            skipped.append(name)
+    return {
+        "requested": requested,
+        "completed": completed,
+        "partial": partial,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+def _mirror_sections(report, ctx):
+    sections = report["collection"]["sections"]
+    for name in ctx.requested:
+        body = report["host"] if name == "host" else report["sections"].get(
+            name, {})
+        sections[name] = {
+            "status": body.get("status", schema.STATUS_TIMEOUT),
+            "reason": body.get("reason", schema.REASON_DEADLINE_EXCEEDED),
+            "detail": body.get("detail", ""),
+        }
+
+
+def finalize(report, ctx, compact=False):
+    collection = report["collection"]
+    collection["profile"] = "inspection"
+    collection["sample_window_ms"] = ctx.sample_ms
+    collection["finished_at"] = utc_now_iso(ctx.wall)
+    collection["duration_ms"] = max(
+        0, int(round((ctx.clock() - ctx.started_clock) * 1000)))
+    truncated = bool(ctx.deadline.truncated or collection.get("truncated"))
+    for body in list(report["sections"].values()) + [report.get("host", {})]:
+        if isinstance(body, dict) and body.get("truncated"):
+            truncated = True
+    collection["truncated"] = truncated
+    _mirror_sections(report, ctx)
+    enforce_size_limit(report, ctx, compact=compact)
+    if collection["truncated"]:
+        collection["truncated"] = True
+    _mirror_sections(report, ctx)
+    collection["coverage"] = _coverage(report, ctx)
+    collection["status"] = _collection_status(report, ctx)
+
+
+def _body(report, name):
+    if name == "host":
+        return report.get("host") or {}
+    return report.get("sections", {}).get(name) or {}
+
+
+def _mark(report, name, detail="trimmed to fit size limit",
+          fragment=False):
+    body = _body(report, name)
+    if not body:
+        return
+    body["truncated"] = True
+    if fragment:
+        body["status"] = schema.STATUS_PARTIAL
+        body["reason"] = schema.REASON_TOTAL_JSON_LIMIT
+        body["detail"] = detail
+    report["collection"]["truncated"] = True
+
+
+def _trim_log(report):
+    body = _body(report, "log")
+    for bucket in (body.get("categories") or {}).values():
+        if bucket.get("samples"):
+            bucket["samples"] = []
+    if body.get("hits"):
+        body["hits"] = []
+    _mark(report, "log")
+
+
+def _trim_service(report):
+    body = _body(report, "service")
+    units = body.get("failed_units") or []
+    if len(units) > 10:
+        body["failed_units"] = units[:10]
+        _mark(report, "service")
+
+
+def _trim_config(report):
+    body = _body(report, "config")
+    if body.get("mount_options"):
+        body["mount_options"] = []
+        _mark(report, "config")
+
+
+def _trim_psi(report):
+    body = _body(report, "psi")
+    for name in psi.RESOURCES:
+        resource = body.get(name)
+        if not isinstance(resource, dict):
+            continue
+        for key in list(resource):
+            if key.startswith(("some_avg60", "some_avg300",
+                               "full_avg60", "full_avg300")):
+                resource.pop(key, None)
+    _mark(report, "psi")
+
+
+def _trim_process_top(report, limit):
+    body = _body(report, "process")
+    changed = False
+    for key in ("top_cpu", "top_sys", "top_blkio_wait", "top_d_state"):
+        rows = body.get(key)
+        if isinstance(rows, list) and len(rows) > limit:
+            body[key] = rows[:limit]
+            changed = True
+    if changed:
+        _mark(report, "process")
+
+
+def _trim_gpu(report, limit):
+    body = _body(report, "gpu")
+    devices = body.get("devices")
+    if isinstance(devices, list) and len(devices) > limit:
+        body["devices"] = devices[:limit]
+        _mark(report, "gpu")
+
+
+def _trim_io(report, limit):
+    body = _body(report, "io")
+    changed = False
+    for key in ("by_disk", "by_vfs"):
+        rows = body.get(key)
+        if isinstance(rows, list) and len(rows) > limit:
+            body[key] = rows[:limit]
+            changed = True
+    if changed:
+        _mark(report, "io")
+
+
+def _trim_network(report, limit):
+    body = _body(report, "network")
+    rows = body.get("interfaces")
+    if isinstance(rows, list) and len(rows) > limit:
+        body["interfaces"] = rows[:limit]
+        _mark(report, "network")
+
+
+def _trim_disk(report, limit):
+    body = _body(report, "disk")
+    changed = False
+    for key in ("devices", "mounts"):
+        rows = body.get(key)
+        if isinstance(rows, list) and len(rows) > limit:
+            body[key] = rows[:limit]
+            changed = True
+    if changed:
+        _mark(report, "disk")
+
+
+def _drop_section(report, name, detail="dropped to fit size limit"):
+    body = _body(report, name)
+    if not body:
+        return
+    replacement = schema.section(
+        status=schema.STATUS_PARTIAL,
+        reason=schema.REASON_TOTAL_JSON_LIMIT,
+        detail=detail,
+    )
+    if name == "host":
+        return
+    report["sections"][name] = replacement
+    report["collection"]["truncated"] = True
+
+
+# 从先丢弃到后丢弃。host/cpu/memory 永远保留。
+TRIM_STEPS = (
+    lambda report: _trim_log(report),
+    lambda report: _trim_service(report),
+    lambda report: _trim_config(report),
+    lambda report: _trim_psi(report),
+    lambda report: _trim_process_top(report, 3),
+    lambda report: _trim_gpu(report, 4),
+    lambda report: _trim_io(report, 3),
+    lambda report: _trim_process_top(report, 0),
+    lambda report: _trim_gpu(report, 0),
+    lambda report: _trim_io(report, 0),
+    lambda report: _trim_network(report, 8),
+    lambda report: _trim_disk(report, 16),
+    lambda report: _trim_network(report, 0),
+    lambda report: _trim_disk(report, 0),
+    lambda report: _drop_section(report, "log"),
+    lambda report: _drop_section(report, "service"),
+    lambda report: _drop_section(report, "config"),
+    lambda report: _drop_section(report, "psi"),
+    lambda report: _drop_section(report, "gpu"),
+    lambda report: _drop_section(report, "io"),
+    lambda report: _drop_section(report, "process"),
+    lambda report: _drop_section(report, "network"),
+    lambda report: _drop_section(report, "disk"),
+)
+
+
+def encode_report(report, compact=False):
+    kwargs = {"ensure_ascii": False, "allow_nan": False}
+    if compact:
+        kwargs["separators"] = (",", ":")
+    else:
+        kwargs["indent"] = 2
+    return (json.dumps(report, **kwargs) + "\n").encode("utf-8")
+
+
+def enforce_size_limit(report, ctx, compact=False):
+    max_bytes = schema.MAX_JSON_BYTES
+    if len(encode_report(report, compact)) <= max_bytes:
+        return
+    report["collection"]["truncated"] = True
+    for step in TRIM_STEPS:
+        step(report)
+        _mirror_sections(report, ctx)
+        if len(encode_report(report, compact)) <= max_bytes:
+            return
+    _mirror_sections(report, ctx)
+
+
+class Parser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        super()._print_message(message, sys.stderr)
+
+
+def _bounded_int(name, low, high):
+    def parse(value):
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("%s must be an integer" % name)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(
+                "%s must be between %d and %d" % (name, low, high))
+        return number
+    return parse
+
+
+def uuid_value(value):
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise argparse.ArgumentTypeError("request-id must be a UUID")
+
+
+def build_parser():
+    parser = Parser(
+        prog="sysak idc_inspect",
+        description="Read-only local host inspection facts as JSON (schema 1.1)",
+        epilog="Schema 1.0 collection: --profile {resources,inspection}. "
+               "Bounded process API: --process-action {check,terminate}, JSON stdin only.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--request-id", type=uuid_value)
+    parser.add_argument("--sample-ms", type=_bounded_int("sample-ms", 200, 5000),
+                        default=1000)
+    parser.add_argument("--timeout", type=_bounded_int("timeout", 5, 300),
+                        default=30)
+    parser.add_argument("--topn", type=_bounded_int("topn", 1, 50), default=10)
+    parser.add_argument("--max-pids", type=_bounded_int("max-pids", 1, 200000),
+                        default=4096)
+    parser.add_argument("-o", "--output", default="-")
+    parser.add_argument("--compact", action="store_true")
+    parser.add_argument("--no-gpu", action="store_true")
+    parser.add_argument("--no-log", action="store_true")
+    parser.add_argument("--no-service", action="store_true")
+    parser.add_argument("--enable-stacks", action="store_true")
+    parser.add_argument("--enable-jbd", action="store_true")
+    parser.add_argument("--enable-cgroup-conn", action="store_true")
+    parser.add_argument("--enable-kernel-detail", action="store_true")
+    parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--schema", action="store_true")
+    parser.add_argument("--upload-report", default=None)
+    return parser
+
+
+def write_output(data, path, stdout):
+    if path == "-":
+        stdout.write(data.decode("utf-8"))
+        stdout.flush()
+        return
+    temporary = None
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=directory,
+                                         prefix=".idc_inspect-",
+                                         delete=False) as stream:
+            temporary = stream.name
+            stream.write(data)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _upload_after_collect(config, grant, report, data, args, transport,
+                          stdout, stderr):
+    from cloud import pop as cloud_pop
+    from cloud import upload as cloud_upload
+
+    status = report["collection"]["status"]
+    payload = {"inspection_id": grant["inspection_id"],
+               "object_key": grant["object_key"], "uploaded": False}
+    if status == "failed":
+        payload["error"] = {"code": "COLLECTION_FAILED",
+                            "message": "collection failed; upload skipped"}
+        print("idc_inspect: collection failed; upload skipped", file=stderr)
+    else:
+        host = report.get("host") or {}
+        identity = {
+            "hostname": host.get("hostname") or socket.gethostname(),
+            "machine_id": host.get("machine_id"),
+            "os": platform.system().lower(),
+            "arch": platform.machine(),
+        }
+        collected_at = report["collection"].get("finished_at")
+        try:
+            result = cloud_upload.complete_upload(
+                config, grant, data, identity, collected_at, transport)
+            payload.update(result)
+            payload["uploaded"] = True
+            print("idc_inspect: uploaded inspection=%s status=%s" % (
+                result["inspection_id"], result["status"]), file=stderr)
+        except cloud_pop.PopError as error:
+            payload["error"] = {"code": error.code, "message": str(error),
+                                "status": error.status,
+                                "retryable": error.retryable}
+            print("idc_inspect: upload failed: %s" % error, file=stderr)
+    if args.upload_report and args.upload_report != "-":
+        try:
+            write_output(
+                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                args.upload_report, stdout)
+        except (OSError, UnicodeError):
+            print("idc_inspect: cannot write upload report", file=stderr)
+
+
+def main(argv=None, context_factory=None, stdout=None, stderr=None,
+         hard_timeout=True, transport=None, env=None):
+    stdout = stdout if stdout is not None else sys.stdout
+    stderr = stderr if stderr is not None else sys.stderr
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if any(value == flag or value.startswith(flag + "=")
+           for value in argv for flag in COMPAT_FLAGS):
+        import idc_compat
+        return idc_compat.main(argv, stdout=stdout, stderr=stderr)
+    args = build_parser().parse_args(argv)
+    if args.schema:
+        text = json.dumps(schema.schema_document(), indent=2,
+                          ensure_ascii=False)
+        stdout.write(text + "\n")
+        stdout.flush()
+        return 0
+
+    from cloud import config as cloud_config
+    from cloud import pop as cloud_pop
+    from cloud import upload as cloud_upload
+
+    upload_config = cloud_config.load_config(env)
+    grant = None
+    request_id = args.request_id or str(uuid.uuid4())
+    if upload_config is not None:
+        identity = {
+            "hostname": socket.gethostname(),
+            "os": platform.system().lower(),
+            "arch": platform.machine(),
+        }
+        try:
+            grant = cloud_upload.create_upload_url(
+                upload_config, identity, transport)
+            # 服务端 inspection_id 为 32 位 hex，必须原样作为 request_id，
+            # 不能经 uuid_value 规范化成带连字符形式，否则后台校验拒收。
+            request_id = grant["inspection_id"]
+        except cloud_pop.PopError as error:
+            grant = None
+            print("idc_inspect: upload url failed: %s" % error, file=stderr)
+    requested, skipped = section_plan(args)
+    if context_factory is not None:
+        ctx = context_factory(args)
+    else:
+        ctx = Context(
+            request_id,
+            sample_ms=args.sample_ms,
+            topn=args.topn,
+            max_pids=args.max_pids,
+            timeout=args.timeout,
+            deep=args.deep,
+        )
+    ctx.request_id = request_id
+    ctx.requested = requested
+    ctx.skipped_sections = skipped
+    ctx.deep = args.deep
+    ctx.topn = max(args.topn, 50) if args.deep else args.topn
+    ctx.max_pids = max(args.max_pids, 16384) if args.deep else args.max_pids
+    ctx.sample_ms = args.sample_ms
+
+    guard = HardTimeoutGuard(args.timeout, enabled=hard_timeout)
+    try:
+        try:
+            with guard:
+                report = collect(ctx, compact=args.compact)
+        except HardTimeout:
+            report = getattr(ctx, "_report", None) or new_report(ctx)
+            report["collection"]["truncated"] = True
+            finalize(report, ctx, compact=args.compact)
+    except Exception:
+        report = getattr(ctx, "_report", None) or new_report(ctx)
+        if not report["collection"]["sections"]:
+            _placeholders(report, ctx)
+        finalize(report, ctx, compact=args.compact)
+
+    try:
+        data = encode_report(report, compact=args.compact)
+    except (TypeError, ValueError):
+        # 理论上 sanitize 已清掉非有限值；这里保证一定输出合法 JSON。
+        report = new_report(ctx)
+        finalize(report, ctx, compact=args.compact)
+        data = encode_report(report, compact=args.compact)
+    try:
+        write_output(data, args.output, stdout)
+    except (OSError, UnicodeError):
+        print("idc_inspect: cannot write JSON output", file=stderr)
+        return 1
+
+    status = report["collection"]["status"]
+    if upload_config is not None and grant is not None:
+        _upload_after_collect(upload_config, grant, report, data, args,
+                              transport, stdout, stderr)
+    if status != schema.STATUS_OK:
+        print("idc_inspect: collection is %s; see section statuses" % status,
+              file=stderr)
+    return 1 if status == "failed" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

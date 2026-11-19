@@ -77,17 +77,43 @@ function agentSightUrl(value) {
   return url.origin;
 }
 
-async function readJson(response) {
-  if (!response.headers.get('content-type')?.includes('application/json')) throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 未返回 JSON', 502);
-  if (Number(response.headers.get('content-length')) > RESPONSE_LIMIT) throw new AgentSightError('AGENTSIGHT_TOO_LARGE', 'AgentSight 单项响应超过 2 MiB 限制', 413);
+async function readText(response, mime, signal) {
+  if (!mime.test(response.headers.get('content-type') || '')) {
+    await response.body?.cancel();
+    throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 响应媒体类型不兼容', 502);
+  }
+  if (Number(response.headers.get('content-length')) > RESPONSE_LIMIT) {
+    await response.body?.cancel();
+    throw new AgentSightError('AGENTSIGHT_TOO_LARGE', 'AgentSight 单项响应超过 2 MiB 限制', 413);
+  }
   const chunks = [];
   let size = 0;
-  for await (const chunk of response.body) {
-    size += chunk.byteLength;
-    if (size > RESPONSE_LIMIT) throw new AgentSightError('AGENTSIGHT_TOO_LARGE', 'AgentSight 单项响应超过 2 MiB 限制', 413);
-    chunks.push(Buffer.from(chunk));
+  const reader = response.body?.getReader();
+  if (!reader) throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 响应正文缺失', 502);
+  const abort = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      size += value.byteLength;
+      if (size > RESPONSE_LIMIT) throw new AgentSightError('AGENTSIGHT_TOO_LARGE', 'AgentSight 单项响应超过 2 MiB 限制', 413);
+      chunks.push(Buffer.from(value));
+    }
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); } catch {
+      throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 响应正文不是有效 UTF-8', 502);
+    }
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {
+}
+async function readJson(response, signal) {
+  const body = await readText(response, /^application\/json(?:\s*;|\s*$)/i, signal);
+  try { return JSON.parse(body); } catch {
     throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 返回了无效 JSON', 502);
   }
 }
@@ -126,6 +152,81 @@ function minimize(key, data) {
   return { status: data.length > limit ? 'truncated' : 'available', reason: data.length > limit ? `展示上限 ${limit} 条，数据未完整返回` : '', data: selected };
 }
 
+const HISTORY_KEYS = ['usage', 'sessions', 'interruptionCounts'];
+const STORED_RANGE = 'start_ns=-9223372036854775808&end_ns=9223372036854775807';
+const USAGE_FAMILIES = {
+  agentsight_token_input_total: { key: 'inputTokens', help: 'Total input tokens consumed by agent (all-time)' },
+  agentsight_token_output_total: { key: 'outputTokens', help: 'Total output tokens consumed by agent (all-time)' },
+  agentsight_llm_requests_total: { key: 'calls', help: 'Total LLM requests made by agent (all-time)' },
+};
+const safeCount = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const boundedText = value => typeof value === 'string' && value.length > 0 && value.length <= 256;
+const storedNs = value => typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) &&
+  value >= Number(-9223372036854775808n) && value <= Number(9223372036854775807n);
+function invalidHistory() {
+  throw new AgentSightError('AGENTSIGHT_INVALID_RESPONSE', 'AgentSight 历史汇总格式、数值或完整性不兼容；累计值未知', 502);
+}
+function historyUsage(body) {
+  const families = new Map(Object.keys(USAGE_FAMILIES).map(name => [name, { help: false, type: false, agents: new Map(), sum: 0n }]));
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^#\s*ERROR\b/.test(line)) invalidHistory();
+    const declaration = /^#\s+(HELP|TYPE)\s+(\w+)\s+(.+)$/.exec(line);
+    if (declaration && families.has(declaration[2])) {
+      const [, kind, name, value] = declaration;
+      const family = families.get(name);
+      const field = kind === 'HELP' ? 'help' : 'type';
+      if (family[field] || value !== (kind === 'HELP' ? USAGE_FAMILIES[name].help : 'counter')) invalidHistory();
+      family[field] = true;
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    const name = /^[a-zA-Z_:][a-zA-Z0-9_:]*/.exec(line)?.[0];
+    if (!families.has(name)) continue; // Never add cache counters or total-token aliases.
+    const sample = /^(\w+)\{agent="((?:[^"\\\r\n]|\\[\\"n])*)"\}\s+([0-9]+)$/.exec(line);
+    if (!sample) invalidHistory(); // No extra labels, timestamps, exponent, negative or fractional counts.
+    const agent = sample[2].replace(/\\([\\"n])/g, (_, escaped) => escaped === 'n' ? '\n' : escaped);
+    const family = families.get(name);
+    if (family.agents.has(agent)) invalidHistory(); // Compare decoded exact identities, not spellings of escapes.
+    const digits = sample[3].replace(/^0+/, '') || '0';
+    if (digits.length > 16) invalidHistory();
+    const count = BigInt(digits); // Check before converting: Number must never round token counts.
+    family.sum += count;
+    if (count > BigInt(Number.MAX_SAFE_INTEGER) || family.sum > BigInt(Number.MAX_SAFE_INTEGER)) invalidHistory();
+    family.agents.set(agent, count);
+  }
+  const inputAgents = families.get('agentsight_token_input_total').agents;
+  for (const family of families.values()) {
+    if (!family.help || !family.type || family.agents.size !== inputAgents.size ||
+        [...inputAgents.keys()].some(agent => !family.agents.has(agent))) invalidHistory();
+  }
+  // The verified handler emits all three authoritative HELP/TYPE pairs even for an empty store.
+  return Object.fromEntries([...families].map(([name, family]) => [USAGE_FAMILIES[name].key, Number(family.sum)]));
+}
+function historySessions(rows) {
+  if (!Array.isArray(rows)) invalidHistory();
+  const ids = new Set();
+  for (const raw of rows) {
+    const row = select(raw, fields.sessions);
+    if (!row || fields.sessions.some(key => !Object.hasOwn(row, key)) || !boundedText(row.session_id) || ids.has(row.session_id) ||
+        !safeCount(row.conversation_count) || !safeCount(row.total_input_tokens) || !safeCount(row.total_output_tokens) ||
+        !storedNs(row.first_seen_ns) || !storedNs(row.last_seen_ns) || row.first_seen_ns > row.last_seen_ns ||
+        !(row.agent_name === null || boundedText(row.agent_name)) || !(row.model === null || boundedText(row.model))) invalidHistory();
+    ids.add(row.session_id);
+  }
+  // Count the entire bounded response, never the 500-row detail projection; do not retain metadata here.
+  return { total: ids.size };
+}
+function historyCounts(raw) {
+  const data = { total: raw?.total, by_severity: select(raw?.by_severity, ['critical', 'high', 'medium', 'low']) };
+  if (!safeCount(data.total) || !object(raw?.by_severity) || Object.keys(raw.by_severity).length !== 4 ||
+      !data.by_severity || !['critical', 'high', 'medium', 'low'].every(key => safeCount(data.by_severity[key]))) invalidHistory();
+  const sum = Object.values(data.by_severity).reduce((total, value) => total + BigInt(value), 0n);
+  if (sum > BigInt(Number.MAX_SAFE_INTEGER) || sum !== BigInt(data.total)) invalidHistory();
+  return data;
+}
+
 async function collectAgentEvidence({ signal, baseUrl = process.env.SYSOM_AGENTSIGHT_URL || 'http://127.0.0.1:7396',
   token = process.env.SYSOM_AGENTSIGHT_TOKEN, fetchImpl = fetch, now = Date.now(), timeoutMs = 5000 } = {}) {
   const started = performance.now();
@@ -141,23 +242,37 @@ async function collectAgentEvidence({ signal, baseUrl = process.env.SYSOM_AGENTS
     interruptionCounts: `/api/interruptions/count?${range}`,
     latency: `/api/metrics/latency?${range}`,
   };
-  const entries = await Promise.all(SOURCE_KEYS.map(async key => {
+  const historyPaths = {
+    usage: '/metrics',
+    sessions: `/api/sessions?${STORED_RANGE}&include_auxiliary=true`,
+    interruptionCounts: `/api/interruptions/count?${STORED_RANGE}`,
+  };
+  async function collect(key, history = false) {
     const timeout = AbortSignal.timeout(timeoutMs);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const prometheus = history && key === 'usage';
     try {
-      const response = await fetchImpl(`${origin}${paths[key]}`, { method: 'GET', signal: requestSignal, redirect: 'error', cache: 'no-store',
-        headers: { accept: 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+      requestSignal.throwIfAborted();
+      const response = await fetchImpl(`${origin}${(history ? historyPaths : paths)[key]}`, { method: 'GET', signal: requestSignal, redirect: 'error', cache: 'no-store',
+        headers: { accept: prometheus ? 'text/plain' : 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
       if (!response.ok) {
         await response.body?.cancel();
+        requestSignal.throwIfAborted();
         return [key, { status: 'unavailable', reason: response.status === 401 || response.status === 403 ? 'AgentSight 拒绝访问，请检查服务鉴权配置' : `AgentSight 接口返回 HTTP ${response.status}`, data: null }];
       }
-      return [key, minimize(key, await readJson(response))];
+      const data = prometheus ? historyUsage(await readText(response, /^text\/plain(?:\s*;|\s*$)/i, requestSignal)) : await readJson(response, requestSignal);
+      return [key, history ? { status: 'available', reason: '', data: key === 'usage' ? data : key === 'sessions' ? historySessions(data) : historyCounts(data) } : minimize(key, data)];
     } catch (error) {
       if (signal?.aborted) throw new AgentSightError('COLLECTION_CANCELLED', 'Agent 诊断已停止');
-      return [key, { status: error instanceof AgentSightError ? 'invalid' : 'unavailable',
+      return [key, { status: timeout.aborted ? 'unavailable' : error instanceof AgentSightError ? 'invalid' : 'unavailable',
         reason: timeout.aborted ? 'AgentSight 接口响应超时' : error instanceof AgentSightError ? error.message : '无法连接本机 AgentSight，请检查是否已独立安装并运行', data: null }];
     }
-  }));
+  }
+  const [entries, historyEntries] = await Promise.all([
+    Promise.all(SOURCE_KEYS.map(key => collect(key))),
+    Promise.all(HISTORY_KEYS.map(key => collect(key, true))),
+  ]);
+  if (signal?.aborted) throw new AgentSightError('COLLECTION_CANCELLED', 'Agent 诊断已停止');
   const sources = Object.fromEntries(entries);
   if (sources.interruptions.status === 'available' && sources.interruptionCounts.status === 'available' &&
       Number.isSafeInteger(sources.interruptionCounts.data?.total) && sources.interruptionCounts.data.total > sources.interruptions.data.length) {
@@ -165,7 +280,8 @@ async function collectAgentEvidence({ signal, baseUrl = process.env.SYSOM_AGENTS
     sources.interruptions.reason = '明细最多返回 200 条未处理中断，全部数量以汇总接口为准';
   }
   const sampledAt = new Date(now + Math.ceil(performance.now() - started)).toISOString();
-  return { schema_version: '1.0', source: 'agentsight', sampled_at: sampledAt, window: { start, end }, sources };
+  return { schema_version: '1.0', source: 'agentsight', sampled_at: sampledAt, window: { start, end }, sources,
+    history: { scope: 'all_stored', sampled_at: sampledAt, sources: Object.fromEntries(historyEntries) } };
 }
 
 function createAgentSightService(options = {}) {

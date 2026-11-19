@@ -21,8 +21,35 @@ function regularFile(file) {
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Expected regular file, not a symlink: ${file}`);
 }
 
+function buildHookRuntime() {
+  const source = path.resolve(ROOT, '../sysagent-agent-hooks/sysagent_hooks');
+  directoryWithoutLinks(source);
+  const modules = {};
+  for (const name of ['__init__', 'event', 'spool', 'history']) {
+    const file = path.join(source, `${name}.py`);
+    regularFile(file);
+    modules[name] = fs.readFileSync(file, 'utf8');
+  }
+  const generated = path.join(ROOT, 'electron/generated');
+  directoryWithoutLinks(path.dirname(generated));
+  if (!fs.existsSync(generated)) fs.mkdirSync(generated, { mode: 0o755 });
+  directoryWithoutLinks(generated);
+  const outfile = path.join(generated, 'hook-runtime.cjs');
+  try { regularFile(outfile); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const temporary = path.join(generated, `.hooks-${crypto.randomUUID()}.cjs`);
+  try {
+    fs.writeFileSync(temporary, `'use strict';\nmodule.exports = ${JSON.stringify(modules)};\n`, { flag: 'wx', mode: 0o644 });
+    directoryWithoutLinks(generated);
+    try { regularFile(outfile); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    fs.renameSync(temporary, outfile);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
 async function buildOpenApi() {
   directoryWithoutLinks(ROOT);
+  buildHookRuntime();
   const service = path.join(ROOT, 'openapi-service.ts');
   const contract = path.join(ROOT, 'openapi-contract.json');
   for (const file of [service, contract]) {
@@ -71,7 +98,7 @@ async function buildOpenApi() {
   process.stdout.write('Built electron/generated/openapi.cjs (Node 20 CommonJS, contract embedded)\n');
 }
 
-module.exports = { buildOpenApi };
+module.exports = { buildOpenApi, buildHookRuntime };
 if (require.main === module) {
   buildOpenApi().catch(error => {
     process.stderr.write(`build:openapi: ${error.message}\n`);

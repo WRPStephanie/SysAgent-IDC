@@ -139,6 +139,8 @@ test('actual HTTP envelopes and encoded generated detail IDs match the served Op
     totals: { sessions: 0, inputTokens: 0, outputTokens: 0, unresolved: null, critical: null, high: null },
     coverage: [{ key: 'processes', status: 'unavailable', reason: 'fixture' }],
     findings: [], processes: [], sessions: [], interruptions: [], latency: [],
+    hooks: { status: 'available', reason: '', skippedLines: 0, agents: [{ agent: 'qoder', sessions: 1, events: 1, prompts: 0, toolStarts: 0, toolEnds: 0, toolFailures: 0, interrupts: 0, permissionDenied: 0, turnFailures: 0, openTools: 0, lastEventAt: '2026-11-11T10:00:00.000Z' }],
+      events: [{ id: '0000000000000001', agent: 'qoder', kind: 'session_start', occurredAt: '2026-11-11T10:00:00.000Z', sessionId: 'fixture', tool: null, callId: null, errorType: null, interrupt: null, subagent: null, model: null }] },
   }, tasks: [] });
   const contract = (await request(f.endpoint, '/api/v1/openapi.json')).body;
   for (const route of ['/api/v1/status', '/api/v1/capabilities', '/api/v1/snapshot', '/api/v1/summary', '/api/v1/report']) {
@@ -148,6 +150,32 @@ test('actual HTTP envelopes and encoded generated detail IDs match the served Op
     assert.equal(schemaMatches(response.body, schema, contract), true, route);
     assert.equal(contract.paths[route].get.parameters.length, 0, route);
   }
+  f.view.agent.hooks.history = {
+    scope: 'cumulative', status: 'available', reason: 'Independent persistent cumulative counters', sampledAt: '2026-11-11T10:00:00.000Z',
+    range: { start: '2026-10-01T00:00:00.000Z', end: '2026-11-11T10:00:00.000Z' },
+    totals: { sessions: 8000, events: 12000, prompts: 8000, toolStarts: 2000, toolEnds: 1000, toolFailures: 0,
+      interrupts: 0, permissionDenied: 0, turnFailures: 0, openTools: 1000 },
+    activity: { events: 0, range: { start: null, end: null }, reason: 'Aggregate enabled after prior rotation',
+      kinds: ['session_start', 'session_end', 'prompt_submit', 'tool_start', 'tool_end', 'tool_failure', 'permission_request', 'permission_denied', 'turn_stop', 'turn_failure', 'notification', 'subagent_start', 'subagent_stop', 'task_created', 'task_completed', 'teammate_idle', 'elicitation', 'elicitation_result', 'compact', 'compact_completed'].map(kind => ({ kind, count: 0 })),
+      bins: [], sessions: [], tools: [], subagents: [] },
+  };
+  f.view.agent.history = {
+    scope: 'all_stored', sampledAt: '2026-11-11T10:00:00Z', status: 'partial',
+    coverage: [{ key: 'usage', status: 'available', reason: '' }, { key: 'sessions', status: 'truncated', reason: 'Response cap' },
+      { key: 'interruptionCounts', status: 'available', reason: '' }],
+    totals: { sessions: null, calls: 14000, inputTokens: 900000, outputTokens: 0, unresolved: 0, critical: 0, high: 0 },
+  };
+  for (const route of ['/api/v1/snapshot', '/api/v1/report']) {
+    const response = await request(f.endpoint, route);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.data.agent.history, f.view.agent.history);
+    assert.equal(response.body.data.agent.history.scope, 'all_stored');
+    assert.deepEqual(response.body.data.agent.hooks.history, f.view.agent.hooks.history);
+    assert.equal(response.body.data.agent.hooks.history.scope, 'cumulative');
+    assert.equal(schemaMatches(response.body, contract.paths[route].get.responses['200'].content['application/json'].schema, contract), true);
+  }
+  assert.equal((await request(f.endpoint, '/api/v1/datasets/agent-hook-events?limit=1')).body.total, 1);
+  assert.equal(f.view.agent.hooks.history.totals.events, 12000);
   const list = await request(f.endpoint, '/api/v1/datasets/agent-coverage');
   assert.equal(list.status, 200);
   const id = list.body.items[0].id;

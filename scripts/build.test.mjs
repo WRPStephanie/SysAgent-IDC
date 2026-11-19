@@ -13,8 +13,9 @@ import { parseArgs } from './build.mjs';
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 const project = resolve(scripts, '..');
-const VERSION = '0.2.17';
+const VERSION = '0.2.19';
 const RUNTIME_VERSION = '0.16.0';
+const QODER_ZIPS = [`sysagent-qoder-plugin-${VERSION}.zip`, `sysagent-qoder-ide-plugin-${VERSION}.zip`];
 const GX_VERSION = '0.6.5-2';
 const GX_FILENAME = `gx_${GX_VERSION}_amd64.deb`;
 const GX_DEB = Buffer.from('!<arch>\ninert bundled GX fixture; never install or execute\n');
@@ -231,6 +232,15 @@ function fixture(t) {
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(resolve(root, 'scripts'));
   copyFileSync(resolve(scripts, 'build.mjs'), resolve(root, 'scripts/build.mjs'));
+  copyFileSync(resolve(scripts, 'package-qoder.mjs'), resolve(root, 'scripts/package-qoder.mjs'));
+  for (const [folder, name] of [['qoder', 'sysagent-agent-hooks'], ['qoder-ide', 'sysagent-agent-hooks-ide']]) {
+    write(root, `plugins/${folder}/.qoder-plugin/plugin.json`, JSON.stringify({ name, version: VERSION, hooks: './hooks/hooks.json' }));
+    write(root, `plugins/${folder}/hooks/hooks.json`, JSON.stringify({ hooks: { SessionStart: [] } }));
+    write(root, `plugins/${folder}/bin/sysagent_hook.py`, '# inert fixture entry; never execute\n');
+  }
+  for (const name of ['__init__.py', 'runtime.py', 'event.py', 'spool.py', 'history.py', 'adapters/__init__.py', 'adapters/qoder.py']) {
+    write(root, `sysagent-agent-hooks/sysagent_hooks/${name}`, '# inert fixture runtime; never execute\n');
+  }
   const versionCheck = readFileSync(resolve(scripts, 'sync-versions.mjs'), 'utf8');
   write(root, 'scripts/sync-versions.mjs', `import { appendFileSync as testAppend } from 'node:fs';\nconst testArgs = process.argv.slice(2);\ntestAppend(process.env.SYSAGENT_BUILD_TEST_LOG, JSON.stringify({ kind: 'versions', args: testArgs }) + '\\n');\nif (JSON.stringify(testArgs) !== JSON.stringify(['--check'])) throw new Error('Build must check versions without rewriting them');\n${versionCheck}`);
   write(root, 'package.json', JSON.stringify({ name: 'sysagent-build-fixture', version: VERSION, type: 'module' }));
@@ -418,6 +428,17 @@ function assertNativeArtifacts(f, { desktop, ide }) {
   } else {
     assert.equal(existsSync(resolve(output, `sysagent-ide-${VERSION}.vsix`)), false);
   }
+  for (const qoderName of QODER_ZIPS) {
+    if (desktop && ide) {
+      artifacts.push(qoderName);
+      const data = readFileSync(resolve(output, qoderName));
+      assert.equal(data.readUInt32LE(0), 0x04034b50);
+      assert.ok(data.includes(Buffer.from('.qoder-plugin/plugin.json')));
+      assert.ok(data.includes(Buffer.from('lib/sysagent_hooks/runtime.py')));
+    } else {
+      assert.equal(existsSync(resolve(output, qoderName)), false);
+    }
+  }
   assertLegal(resolve(f.root, 'sysagent-idc/dist'));
   assertLegal(output);
   assertChecksums(output, artifacts);
@@ -426,7 +447,7 @@ function assertNativeArtifacts(f, { desktop, ide }) {
 
 test('parseArgs defaults to all and accepts every target and supported flag', () => {
   assert.deepEqual(parseArgs([]), { target: 'all', skipInstall: false, help: false });
-  for (const target of ['all', 'desktop', 'ide', 'web']) {
+  for (const target of ['all', 'desktop', 'ide', 'web', 'qoder']) {
     assert.deepEqual(parseArgs(['--target', target]), { target, skipInstall: false, help: false });
     assert.deepEqual(parseArgs(['--skip-install', '--target', target]), { target, skipInstall: true, help: false });
   }
@@ -453,7 +474,7 @@ test('help has no version, npm, native preparation, packaging or filesystem side
     const before = snapshot(f.root);
     const result = f.execute([flag]);
     succeeded(result);
-    for (const option of ['--target', '--skip-install', 'all', 'desktop', 'ide', 'web']) assert.ok(result.stdout.includes(option));
+    for (const option of ['--target', '--skip-install', 'all', 'desktop', 'ide', 'web', 'qoder']) assert.ok(result.stdout.includes(option));
     assert.deepEqual(f.events(), []);
     assert.deepEqual(snapshot(f.root), before);
   }
@@ -483,6 +504,108 @@ test('fresh web installs only web dependencies with ignore-scripts and copies le
   assert.equal(existsSync(resolve(f.root, 'sysagent-ide-extension/node_modules')), false);
   assert.equal(f.events().some(event => /^(?:load|verify|package)-(?:sysak|agentsight|runtime|gx)/.test(event.kind)), false);
   f.assertLatestUnchanged();
+});
+
+test('qoder only packages static inputs with no dependencies, native bundles or frontend builds', t => {
+  for (const flags of [[], ['--skip-install']]) {
+    const f = fixture(t);
+    rmSync(resolve(f.root, 'vendor'), { recursive: true });
+    rmSync(resolve(f.root, 'sysagent-idc/scripts'), { recursive: true });
+    const pluginBefore = snapshot(resolve(f.root, 'plugins'));
+    const homeBefore = snapshot(resolve(f.root, 'home'));
+    succeeded(f.execute(['--target', 'qoder', ...flags]));
+    assert.deepEqual(f.calls(), []);
+    assertPreflight(f);
+    assert.equal(f.events().filter(event => event.kind === 'child').length, 1, 'Only read-only version preflight may spawn a process');
+    assert.equal(existsSync(resolve(f.root, 'sysagent-idc/node_modules')), false);
+    assert.equal(existsSync(resolve(f.root, 'sysagent-idc/dist')), false);
+    assert.equal(existsSync(resolve(f.root, 'sysagent-idc/resources/sysak')), false);
+    const output = resolve(f.root, `release/build-${VERSION}`);
+    assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', ...QODER_ZIPS].sort());
+    assertChecksums(output, QODER_ZIPS);
+    assert.deepEqual(snapshot(resolve(f.root, 'plugins')), pluginBefore);
+    assert.deepEqual(snapshot(resolve(f.root, 'home')), homeBefore);
+    f.assertLatestUnchanged();
+  }
+});
+
+test('qoder preserves unrelated existing batch checksums and replaces only its ZIP checksum', t => {
+  const f = fixture(t);
+  const output = resolve(f.root, `release/build-${VERSION}`);
+  write(output, 'keep.deb', 'inert accepted artifact\n');
+  write(output, 'SHA256SUMS', `${sha256(readFileSync(resolve(output, 'keep.deb')))}  keep.deb\n${'0'.repeat(64)}  ${QODER_ZIPS[0]}\n`);
+  succeeded(f.execute(['--target', 'qoder']));
+  assertChecksums(output, ['keep.deb', ...QODER_ZIPS]);
+  assert.equal(readFileSync(resolve(output, 'keep.deb'), 'utf8'), 'inert accepted artifact\n');
+});
+
+test('desktop and ide preserve the complete batch checksums when rebuilt separately', nativeOptions, t => {
+  for (const target of ['desktop', 'ide']) {
+    const f = fixture(t);
+    succeeded(f.execute(['--target', 'all']));
+    const output = resolve(f.root, `release/build-${VERSION}`);
+    const manifest = resolve(output, 'SHA256SUMS');
+    const lines = readFileSync(manifest, 'utf8').trim().split('\n');
+    const artifacts = lines.map(line => line.slice(66));
+    const rebuilt = target === 'ide' ? `sysagent-ide-${VERSION}.vsix` : `sysagent-idc_${VERSION}_amd64.deb`;
+    writeFileSync(manifest, lines.map(line => line.endsWith(`  ${rebuilt}`) ? `${'0'.repeat(64)}  ${rebuilt}` : line).join('\n') + '\n');
+    const untouched = artifacts.filter(name => name.endsWith('.zip') || (target === 'ide' ? name.endsWith('.deb') : name.endsWith('.vsix')));
+    const before = untouched.map(name => sha256(readFileSync(resolve(output, name))));
+    succeeded(f.execute(['--target', target]));
+    assertChecksums(output, artifacts);
+    assert.deepEqual(untouched.map(name => sha256(readFileSync(resolve(output, name)))), before);
+    f.assertLatestUnchanged();
+  }
+});
+
+test('plugin manifest mismatch fails both qoder and all before dependency installation without rewriting', t => {
+  for (const folder of ['qoder', 'qoder-ide']) {
+    for (const target of ['qoder', 'all']) {
+      const f = fixture(t);
+      updateJson(f.root, `plugins/${folder}/.qoder-plugin/plugin.json`, data => { data.version = '0.0.1'; });
+      const before = snapshot(resolve(f.root, 'plugins'));
+      const result = f.execute(['--target', target]);
+      failed(result);
+      assert.ok(result.stderr.includes(`plugins/${folder}/.qoder-plugin/plugin.json`), result.stderr);
+      assert.deepEqual(f.calls(), []);
+      assert.deepEqual(snapshot(resolve(f.root, 'plugins')), before);
+      assert.equal(existsSync(resolve(f.root, `release/build-${VERSION}`)), false);
+    }
+  }
+});
+
+test('qoder IDE hooks that break IDE rules fail without producing any ZIP or checksum manifest', t => {
+  const f = fixture(t);
+  write(f.root, 'plugins/qoder-ide/hooks/hooks.json', JSON.stringify({ hooks: { SessionStart: [], StopFailure: [] } }));
+  const result = f.execute(['--target', 'qoder']);
+  failed(result);
+  assert.match(result.stderr, /Qoder IDE hooks 违反 IDE 规则（StopFailure）/);
+  assert.equal(existsSync(resolve(f.root, `release/build-${VERSION}`)), false, 'A bad IDE variant must not leave the Qoder ZIP behind');
+});
+
+test('version synchronization updates the plugin manifest while preserving its other fields', t => {
+  const f = fixture(t);
+  copyFileSync(resolve(scripts, 'sync-versions.mjs'), resolve(f.root, 'scripts/sync-versions.mjs'));
+  const manifests = { qoder: 'sysagent-agent-hooks', 'qoder-ide': 'sysagent-agent-hooks-ide' };
+  for (const folder of Object.keys(manifests)) {
+    updateJson(f.root, `plugins/${folder}/.qoder-plugin/plugin.json`, data => { data.version = '0.0.1'; data.description = 'keep plugin metadata'; });
+  }
+  succeeded(spawnSync(process.execPath, [resolve(f.root, 'scripts/sync-versions.mjs')], {
+    cwd: f.root, env: f.env, encoding: 'utf8', timeout: 15_000,
+  }));
+  for (const [folder, name] of Object.entries(manifests)) {
+    assert.deepEqual(JSON.parse(readFileSync(resolve(f.root, `plugins/${folder}/.qoder-plugin/plugin.json`), 'utf8')), {
+      name, version: VERSION, hooks: './hooks/hooks.json', description: 'keep plugin metadata',
+    });
+  }
+});
+
+test('qoder missing runtime fails without producing a ZIP or checksum manifest', t => {
+  const f = fixture(t);
+  rmSync(resolve(f.root, 'sysagent-agent-hooks/sysagent_hooks/runtime.py'));
+  failed(f.execute(['--target', 'qoder']));
+  assert.deepEqual(f.calls(), []);
+  assert.equal(existsSync(resolve(f.root, `release/build-${VERSION}`)), false);
 });
 
 test('web skip-install reuses existing node_modules and never reinstalls', t => {
@@ -660,7 +783,7 @@ test('native skip-install requires all selected packages before running any npm 
   }
 });
 
-test('default all orchestrates main deb, official GX deb, independent runtime deb and VSIX without host installation', nativeOptions, t => {
+test('default all orchestrates three debs, VSIX and Qoder ZIP without host installation', nativeOptions, t => {
   const f = fixture(t);
   const result = f.execute();
   succeeded(result);
@@ -737,6 +860,18 @@ test('all fails on each npm or runtime helper error without claiming success', n
       f.assertLatestUnchanged();
     });
   }
+});
+
+test('all reports a Qoder packaging failure without writing SHA256SUMS or claiming success', nativeOptions, t => {
+  const f = fixture(t);
+  rmSync(resolve(f.root, 'sysagent-agent-hooks/sysagent_hooks/runtime.py'));
+  const result = f.execute(['--target', 'all']);
+  failed(result);
+  assert.match(result.stderr, /Qoder.*Python/);
+  assert.equal(existsSync(resolve(f.root, `release/build-${VERSION}/SHA256SUMS`)), false);
+  for (const name of QODER_ZIPS) assert.equal(existsSync(resolve(f.root, `release/build-${VERSION}/${name}`)), false);
+  assert.equal(f.events().some(event => /^forbidden-/.test(event.kind)), false);
+  f.assertLatestUnchanged();
 });
 
 test('successful commands with missing outputs do not reuse old batches or emit success', nativeOptions, async t => {

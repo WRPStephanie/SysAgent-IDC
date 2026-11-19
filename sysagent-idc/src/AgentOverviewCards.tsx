@@ -1,6 +1,54 @@
-import type { MouseEventHandler } from 'react';
-import { Bot, ChevronRight, Coins, HeartPulse, MessagesSquare, TriangleAlert } from 'lucide-react';
+import { useEffect, useRef, useState, type MouseEventHandler } from 'react';
+import { Bot, ChevronRight, Coins, HeartPulse, LoaderCircle, MessagesSquare, RefreshCw, TriangleAlert } from 'lucide-react';
 import { agentSummary, formatNumber } from './agent-summary';
+import { agentStatisticsCards } from './AgentActivityCharts';
+import { fetchAgentDiagnostic } from './idc-client';
+import type { AgentDiagnostic } from './agent-diagnostics-data';
+import { localTime } from '../agent-diagnostics';
+
+export function HomeAgentStatistics({ onOpen }: { onOpen: () => void }) {
+  const [report, setReport] = useState<AgentDiagnostic | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const mounted = useRef(false);
+  const requestLock = useRef(false);
+
+  async function load(refresh: boolean) {
+    if (!mounted.current || requestLock.current) return;
+    requestLock.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      const next = await fetchAgentDiagnostic(refresh);
+      if (mounted.current) setReport(next);
+    } catch {
+      if (mounted.current) setError('暂时无法更新 Agent 统计，请稍后重试。');
+    } finally {
+      requestLock.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    mounted.current = true;
+    void load(false);
+    return () => { mounted.current = false; };
+  }, []);
+
+  return <section className="sh-home-panel agent sh-agent-summary ad-live" aria-label="Agent 总体统计" aria-busy={busy}>
+    <div className="sh-panel-head">
+      <span className="sh-panel-mark"><Bot size={19} /></span>
+      <div><h2>Agent 总体统计</h2><p>本机已记录活动 · 汇总与明细分开 · 只读</p></div>
+      <div className="sh-panel-aside sh-agent-summary-actions">
+        <button className="hg-text-button" disabled={busy} aria-label="刷新 Agent 总体统计" onClick={() => { void load(true); }}>{busy ? <LoaderCircle size={13} className="spinning" /> : <RefreshCw size={13} />}刷新统计</button>
+        <button className="hg-text-button" onClick={onOpen}>进入 Agent 管家<ChevronRight size={13} /></button>
+      </div>
+    </div>
+    {agentStatisticsCards(report)}
+    <p className="sh-agent-summary-note" role="status">{busy ? report ? '正在更新，当前显示上次报告。' : '正在获取 Agent 统计…' : report ? `更新于 ${localTime(report.sampledAt)} · — 表示未知。` : '尚未取得本机报告，— 表示未知。'}</p>
+    {error && <p className="sh-agent-summary-error" role="alert">{error}{report ? ' 保留上次报告，不代表本次状态。' : ''}</p>}
+  </section>;
+}
 
 const agentColors = ['#5b7cfa', '#a5b8ff'];
 

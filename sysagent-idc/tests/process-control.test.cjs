@@ -296,11 +296,20 @@ function healthState(revision = 1) {
       unit: id === 'energy' ? 'W' : '%', source: 'sysak', rows: [],
     }])), inspections: [], optimizations: [], operations: [] };
 }
+function withEnergyProcesses(state, targets = identities) {
+  const processes = targets.filter(target => Number.isSafeInteger(target.pid) && target.pid > 1 &&
+    Number.isSafeInteger(target.starttime) && target.starttime >= 0).slice(0, 40)
+    .map(target => collectedRow(target, { usage: 3, quantity: { value: 3, unit: 'W' } }));
+  state.resources.energy.power = { method: 'measured', cpuWatts: processes.length * 3 + 14, gpuWatts: null, missing: [],
+    processes, unattributedCpuWatts: 14 };
+  return state;
+}
 function processState(revision = 1, targets = identities) {
   const state = healthState(revision);
   for (const id of ['cpu', 'memory', 'disk']) state.resources[id].rows = targets.map(target => collectedRow(target));
-  return state;
+  return withEnergyProcesses(state, targets);
 }
+const processRowsFor = (state, resource) => resource === 'energy' ? state.resources.energy.power?.processes || [] : state.resources[resource].rows;
 function responseFor(body, state) {
   const taskId = randomUUID();
   return { schema_version: '1.1', request_id: body.request_id, task_id: taskId, mode: 'mock', read_only: true, state,
@@ -413,6 +422,13 @@ test('local annotation overrides both remote true/false flags, checks raw identi
   }
   for (const id of ['gpu', 'energy']) assert.equal(state.resources[id].rows[0].cleanable, false);
   for (const resource of Object.values(state.resources)) assert(resource.rows.every(row => !row.defaultSelected));
+  const energyProcesses = state.resources.energy.power.processes;
+  assert.equal(energyProcesses[0].cleanable, true);
+  assert.match(energyProcesses[0].effect, /整个进程.*SIGTERM/);
+  assert.equal(energyProcesses[1].cleanable, false);
+  assert.equal(energyProcesses[1].effect, 'manager ancestor is protected');
+  assert(energyProcesses.every(row => !row.defaultSelected));
+  await assert.rejects(prepare(fixture.controller, state, 'energy', [rowId(identities[1])]), errorIs('PROTECTED_PROCESS'));
   await assert.rejects(prepare(fixture.controller, state, 'cpu', [rowId(identities[1])]), errorIs('PROTECTED_PROCESS'));
   assert.equal(fixture.actions.length, 1);
 });
@@ -519,7 +535,7 @@ test('annotation is bounded to 100 unique raw targets, and process-action unavai
 });
 
 test('prepare checks selected targets again, uses authoritative names and issues an isolated 60-second opaque plan; execute uses only its token once', linux, async t => {
-  for (const resource of ['cpu', 'memory', 'disk']) await t.test(resource, async t => {
+  for (const resource of ['cpu', 'memory', 'disk', 'energy']) await t.test(resource, async t => {
     const fixture = await controllerFixture(t);
     const state = await fixture.controller.snapshot();
     const selected = [...identities].reverse();
@@ -543,6 +559,8 @@ test('prepare checks selected targets again, uses authoritative names and issues
     const cached = await fixture.controller.snapshot();
     assert.equal(cached.revision, state.revision);
     for (const resource of Object.values(cached.resources)) assert(resource.rows.every(row => !row.cleanable));
+    assert(cached.resources.energy.power.processes.every(row => !row.cleanable && !row.defaultSelected));
+    await assert.rejects(prepare(fixture.controller, cached, 'energy', selected.map(rowId)), errorIs('PROTECTED_PROCESS'));
     await assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }), errorIs('INVALID_CLEANUP_PLAN'));
     assert.equal(fixture.actions.length, 3);
   });
@@ -552,7 +570,7 @@ test('prepare validates payload, allowed resource/IDs/count and current revision
   const fixture = await controllerFixture(t);
   const state = await fixture.controller.snapshot();
   const good = { resource: 'cpu', ids: [rowId(identities[0])], revision: state.revision };
-  for (const payload of [null, [], {}, { ...good, resource: 'gpu' }, { ...good, resource: 'energy' },
+  for (const payload of [null, [], {}, { ...good, resource: 'gpu' },
     { ...good, resource: '__proto__' }, { ...good, ids: [] }, { ...good, ids: 'not-array' },
     { ...good, ids: [1] }, { ...good, ids: [good.ids[0], good.ids[0]] },
     { ...good, ids: Array.from({ length: 11 }, (_, index) => `id-${index}`) },
@@ -944,4 +962,193 @@ test('raw parser retains recognized Agents outside the overall Top20 for CPU/mem
     assert.deepEqual(collectedRankingRows(resource, true).map(row => row.pid), Array.from({ length: 10 }, (_, index) => 960025 + index));
     assert(resource.rows.every(row => !row.cleanable && !row.defaultSelected));
   }
+});
+
+test('energy-only estimates join one raw identity check, while components and forged/stale identities never authorize cleanup', linux, async t => {
+  await t.test('energy-only rows are checked and component IDs are rejected atomically', async t => {
+    const fixture = await controllerFixture(t, { state: revision => {
+      const state = withEnergyProcesses(healthState(revision));
+      state.resources.energy.rows = [collectedRow(identities[0], { id: 'rapl-package-0', name: 'CPU package 0', powerSource: 'rapl',
+        quantity: { value: 20, unit: 'W' } })];
+      return state;
+    } });
+    const state = await fixture.controller.snapshot();
+    assert.deepEqual(fixture.actions, [{ action: 'check', targets: identities }]);
+    assert(state.resources.energy.power.processes.every(row => row.cleanable && !row.defaultSelected));
+    assert.equal(state.resources.energy.rows[0].cleanable, false);
+    assert.equal(state.resources.energy.rows[0].defaultSelected, false);
+    for (const ids of [['rapl-package-0'], ['unknown'], [rowId(identities[0]), 'rapl-package-0']]) {
+      await assert.rejects(prepare(fixture.controller, state, 'energy', ids), errorIs('PROTECTED_PROCESS'));
+    }
+    assert.equal(fixture.actions.length, 1, 'no partial prepare/check may occur when any selected ID is invalid');
+    const plan = await prepare(fixture.controller, state, 'energy');
+    assert.deepEqual(plan.processes, [{ id: rowId(identities[0]), ...identities[0], name: `checked-${identities[0].pid}` }]);
+    await fixture.controller.executeProcessCleanup({ token: plan.token });
+    const cached = await fixture.controller.snapshot();
+    assert.equal(cached.resources.energy.power.processes[0].cleanable, false);
+    assert.equal(cached.resources.energy.power.processes[1].cleanable, true);
+    assert.equal(cached.resources.energy.rows[0].cleanable, false);
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.spawns.length, 1);
+  });
+  const cases = [
+    ['component masquerading as a process with no estimate', null, state => {
+      state.resources.energy.rows = [collectedRow()]; state.resources.energy.power.processes = [];
+    }],
+    ['power absent', null, state => { delete state.resources.energy.power; }],
+    ['empty estimates', null, state => { state.resources.energy.power.processes = []; }],
+    ['no observed identities', raw => clearTargets(raw)],
+    ['raw identity is stale', raw => eachTargetList(raw, () => [{ ...identities[0], starttime: 9999 }])],
+    ['raw PID string', raw => eachTargetList(raw, () => [{ ...identities[0], pid: String(identities[0].pid) }])],
+    ['raw starttime missing', raw => eachTargetList(raw, () => [{ pid: identities[0].pid }])],
+    ['forged estimate ID', null, state => { state.resources.energy.power.processes[0].id = 'forged-process'; }],
+    ['estimate PID mismatch', null, state => { state.resources.energy.power.processes[0].pid++; }],
+    ['estimate starttime mismatch', null, state => { state.resources.energy.power.processes[0].starttime++; }],
+  ];
+  for (const [name, mutateRaw, mutateState] of cases) await t.test(name, async t => {
+    const fixture = await controllerFixture(t, { raw(requestId) { const raw = rawSnapshot(requestId); mutateRaw?.(raw); return raw; },
+      state(revision) { const state = withEnergyProcesses(healthState(revision), [identities[0]]); mutateState?.(state); return state; } });
+    const state = await fixture.controller.snapshot();
+    assert(processRowsFor(state, 'energy').every(row => !row.cleanable && !row.defaultSelected));
+    assert(state.resources.energy.rows.every(row => !row.cleanable && !row.defaultSelected));
+    assert.deepEqual(fixture.actions, []);
+    const id = processRowsFor(state, 'energy')[0]?.id || rowId(identities[0]);
+    await assert.rejects(prepare(fixture.controller, state, 'energy', [id]), errorIs('PROTECTED_PROCESS'));
+    assert.deepEqual(fixture.actions, []);
+  });
+  await t.test('a valid CPU identity cannot bless a forged energy row with the same ID', async t => {
+    const fixture = await controllerFixture(t, { state(revision) {
+      const state = processState(revision, [identities[0]]);
+      state.resources.energy.power.processes[0].starttime++;
+      return state;
+    } });
+    const state = await fixture.controller.snapshot();
+    assert.deepEqual(fixture.actions, [{ action: 'check', targets: [identities[0]] }]);
+    assert.equal(state.resources.cpu.rows[0].cleanable, true);
+    assert.equal(state.resources.energy.power.processes[0].cleanable, false);
+    await assert.rejects(prepare(fixture.controller, state, 'energy'), errorIs('PROTECTED_PROCESS'));
+  });
+});
+
+test('energy prepare rechecks protection and availability; authoritative names are data, never action parameters', linux, async t => {
+  for (const status of ['protected', 'permission_denied', 'stale', 'gone', 'unsupported', 'unavailable']) {
+    await t.test(status, async t => {
+      const fixture = await controllerFixture(t, { action(verb, targets, count) {
+        if (count < 3) return resultsFor(verb, targets);
+        if (status === 'unavailable') throw new Error('fixture check failure');
+        return resultsFor(verb, targets, status);
+      } });
+      const state = await fixture.controller.snapshot();
+      const old = await prepare(fixture.controller, state, 'energy');
+      await assert.rejects(prepare(fixture.controller, state, 'energy'),
+        errorIs(status === 'unavailable' ? 'PROCESS_CONTROL_UNAVAILABLE' : 'PROTECTED_PROCESS', status === 'unavailable' ? 503 : 409));
+      await assert.rejects(fixture.controller.executeProcessCleanup({ token: old.token }), errorIs('INVALID_CLEANUP_PLAN'));
+      assert.equal(fixture.actions.length, 3);
+      assert(fixture.actions.every(item => item.action === 'check'));
+    });
+  }
+  await t.test('check failure disables energy as well as CPU/memory/disk', async t => {
+    const fixture = await controllerFixture(t, { action() { throw new Error('fixture unavailable'); } });
+    const state = await fixture.controller.snapshot();
+    for (const id of ['cpu', 'memory', 'disk', 'energy']) for (const row of processRowsFor(state, id)) {
+      assert.equal(row.cleanable, false);
+      assert.match(row.effect, /受控进程操作不可用/);
+    }
+    await assert.rejects(prepare(fixture.controller, state, 'energy'), errorIs('PROTECTED_PROCESS'));
+    assert.equal(fixture.actions.length, 1);
+  });
+  await t.test('injected shell/HTML-looking names remain authoritative text only', async t => {
+    const name = '<script>fixture()</script>; $(never-run)\n"quoted"';
+    const fixture = await controllerFixture(t, { action: (verb, targets) => resultsFor(verb, targets).map(item => ({ ...item, name })) });
+    const state = await fixture.controller.snapshot();
+    const plan = await prepare(fixture.controller, state, 'energy');
+    assert.equal(plan.processes[0].name, name);
+    assert.notEqual(plan.processes[0].name, state.resources.energy.power.processes[0].name);
+    plan.processes[0].pid = 1;
+    plan.processes[0].starttime = 0;
+    const result = await fixture.controller.executeProcessCleanup({ token: plan.token });
+    assert.deepEqual(fixture.actions.at(-1), { action: 'terminate', targets: [identities[0]] });
+    assert.equal(result.results[0].name, name);
+    assert.equal(fixture.spawns.length, 1, 'no name is interpolated into a command');
+  });
+});
+
+test('energy tokens expire once, are invalidated across resources/refresh/pause, and forbid caller-injected identities', linux, async t => {
+  for (const change of ['expiry', 'cpu replacement', 'refresh', 'pause']) await t.test(change, async t => {
+    const fixture = await controllerFixture(t);
+    const state = await fixture.controller.snapshot();
+    const plan = await prepare(fixture.controller, state, 'energy');
+    assert.equal(Date.parse(plan.expires_at), fixture.clock.now + 60000);
+    for (const payload of [{ token: plan.token, targets: identities }, { token: plan.token, resource: 'energy' }]) {
+      await assert.rejects(fixture.controller.executeProcessCleanup(payload), errorIs('INVALID_PARAMETERS', 400));
+    }
+    if (change === 'expiry') fixture.clock.advance(60000);
+    if (change === 'cpu replacement') await prepare(fixture.controller, state, 'cpu');
+    if (change === 'refresh') await fixture.controller.snapshot(true);
+    if (change === 'pause') {
+      fixture.controller.setEnabled(false);
+      await assert.rejects(prepare(fixture.controller, state, 'energy'), errorIs('COLLECTOR_DISABLED'));
+      await assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }), errorIs('COLLECTOR_DISABLED'));
+      fixture.controller.setEnabled(true);
+    }
+    await assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }),
+      errorIs(change === 'expiry' ? 'EXPIRED_CLEANUP_PLAN' : 'INVALID_CLEANUP_PLAN'));
+    await assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }), errorIs('INVALID_CLEANUP_PLAN'));
+    assert(fixture.actions.every(item => item.action === 'check'));
+  });
+});
+
+test('energy execution consumes its token before awaiting, disables every same-identity resource, and fails closed on uncertain results', linux, async t => {
+  for (const uncertain of [false, true]) await t.test(uncertain ? 'uncertain' : 'signalled', async t => {
+    const entered = deferred();
+    const release = deferred();
+    t.after(() => release.resolve());
+    const fixture = await controllerFixture(t, { async action(verb, targets) {
+      if (verb === 'terminate') {
+        entered.resolve();
+        await release.promise;
+        if (uncertain) throw new Error('fixture protocol failure after possible signal');
+      }
+      return resultsFor(verb, targets);
+    } });
+    const state = await fixture.controller.snapshot();
+    const plan = await prepare(fixture.controller, state, 'energy');
+    const execution = fixture.controller.executeProcessCleanup({ token: plan.token });
+    const outcome = uncertain ? assert.rejects(execution, errorIs('PROCESS_RESULT_UNKNOWN', 503)) : execution;
+    const replay = assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }), errorIs('INVALID_CLEANUP_PLAN'));
+    await entered.promise;
+    const cached = await fixture.controller.snapshot();
+    for (const id of ['cpu', 'memory', 'disk', 'energy']) {
+      assert.equal(processRowsFor(cached, id)[0].cleanable, false);
+      assert.equal(processRowsFor(cached, id)[1].cleanable, true);
+    }
+    assert.equal(fixture.actions.filter(item => item.action === 'terminate').length, 1);
+    release.resolve();
+    await outcome;
+    await replay;
+    const after = await fixture.controller.snapshot();
+    assert.equal(after.operations.length, uncertain ? 0 : 1);
+    await assert.rejects(prepare(fixture.controller, after, 'energy'), errorIs('PROTECTED_PROCESS'));
+    await assert.rejects(prepare(fixture.controller, after, 'cpu'), errorIs('PROTECTED_PROCESS'));
+    assert.equal(fixture.requests.length, 1, 'neither successful nor uncertain execution performs remote cleanup');
+    const refreshed = await fixture.controller.snapshot(true);
+    assert(processRowsFor(refreshed, 'energy').every(row => row.cleanable));
+  });
+});
+
+test('energy execution reports each sysAK revalidation outcome without fabricating successful termination', linux, async t => {
+  const targets = Array.from({ length: 6 }, (_, index) => ({ pid: 970000 + index, starttime: index }));
+  const statuses = ['signalled', 'protected', 'permission_denied', 'stale', 'gone', 'unsupported'];
+  const fixture = await controllerFixture(t, { raw: requestId => rawSnapshot(requestId, targets),
+    state: revision => processState(revision, targets), action: (verb, selected) => verb === 'check' ? resultsFor(verb, selected) :
+      selected.map((target, index) => resultsFor(verb, [target], statuses[index])[0]) });
+  const state = await fixture.controller.snapshot();
+  const plan = await prepare(fixture.controller, state, 'energy', targets.map(rowId));
+  const result = await fixture.controller.executeProcessCleanup({ token: plan.token });
+  assert.deepEqual(result.results.map(item => item.status), statuses);
+  assert.deepEqual(result.results.map(item => item.eligible), [true, false, false, false, false, false]);
+  const cached = await fixture.controller.snapshot();
+  for (const id of ['cpu', 'memory', 'disk', 'energy']) assert(processRowsFor(cached, id).every(row => !row.cleanable));
+  assert.deepEqual(cached.operations[0].names, result.results.map(item => `${item.name} (PID ${item.pid}) · ${item.status}`));
+  await assert.rejects(fixture.controller.executeProcessCleanup({ token: plan.token }), errorIs('INVALID_CLEANUP_PLAN'));
 });

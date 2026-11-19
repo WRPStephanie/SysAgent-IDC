@@ -3,7 +3,7 @@
   "platform": "linux",
   "arch": "x64",
   "commands": [
-    "idc",
+    "idc_inspect",
     "resource_anomaly",
     "memgraph",
     "ai"
@@ -25,10 +25,10 @@
     ]
   },
   "files": {
-    ".sysak_components/tools/.sysak.rules": "2afe4ef4723f5119c1ecc86335012b0faa6bb951e1944997d9c56ceaaf3fc6c1",
-    ".sysak_components/tools/ai": "9fd0165f597eed4f0d918ad893708dd148ffc314164e1b3c36153b1e79feaad2",
+    ".sysak_components/tools/.sysak.rules": "4de769b2ab2a5348c1a8514325a7e78830447fef445380eeb25bfb7ef0cf5f21",
+    ".sysak_components/tools/ai": "a3b46ec3722898651ed8c4b25a37454fd084ca2951bd107a41d8afb77fcf0f08",
     ".sysak_components/tools/fdleak_metrics.py": "abb95060f86d7e0e895d76b9b3bcb9413ce54d5206dfb12f5bcac4e0b17112f6",
-    ".sysak_components/tools/idc": "ff3619660a7b745fc6f6f35a446985be7d1220f217d727dbd7ee4ebc18541f70",
+    ".sysak_components/tools/idc_inspect": "9672eae1d2af595ff4683a9192e6984b08a118b51a3cefe1cf799c8fa2390743",
     ".sysak_components/tools/mem_utils.py": "b68a7e05dcd9b5854ac53a7aa46845f2163ff434ab16823cd2044264a7d989d3",
     ".sysak_components/tools/memgraph": "7c21944465eecb2e19764e1c6ffdeccb8cb55cda5cc672978e121b7c74d4ddfb",
     ".sysak_components/tools/plugin_abnormalPackages.py": "e1fdbc8f6ac3a00f361a149e66dc9e1ad0472cbca8ab4653cb1854b486a5fefd",
@@ -47,7 +47,7 @@
     ".sysak_components/tools/plugin_thpCollect.py": "40c8cfa6b7d0c1d53d9df1a8352413c89017dd27e443d8205feb35b5c62bfbd6",
     ".sysak_components/tools/plugin_vmRssTaskTop.py": "5f97816d9837d43d9f5277e33bdd5069bdf667dded47abe10852e58f7a667c56",
     ".sysak_components/tools/resource_anomaly": "bbbd6c9c9e57e00485a19e163aa84c509f1cb1af1a71bf8ed1979d386eda4daa",
-    ".sysak_components/tools/resource_anomaly_idc.py": "05228df5d1e3bed4d826f771545e3b91dbe71b3fe3ab5f1ba6452f512c7adb32",
-    "sysak": "6939db93403e269e47d6b02d0c1f3825d78d9066b4134798dcc4f0eff5e64d8f"
+    ".sysak_components/tools/resource_anomaly_idc.py": "ededd569e38172751678fbfdcefe4c4a6755d76fb72f852540248e2ed62d599d",
+    "sysak": "8d03d590004263f37a43f3c5b367012a5adf6216a48b5aea007491e95e352c23"
   }
 }

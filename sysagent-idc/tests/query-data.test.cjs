@@ -7,6 +7,16 @@ const { datasetCatalog, queryDataset, QueryError, openApiContract } = require('.
 const TIME = '2026-11-01T12:00:00.000Z';
 const params = text => new URLSearchParams(text);
 const query = (view, name, text = '', id) => queryDataset(view, name, params(text), id);
+const hookEvent = (overrides = {}) => ({
+  id: '0000000000000001', agent: 'qoder', kind: 'tool_failure', occurredAt: TIME,
+  sessionId: null, tool: 'read_file', callId: 'call:1', errorType: null, interrupt: null,
+  subagent: 'code reviewer', model: 'model v1', ...overrides,
+});
+const hookAgent = (overrides = {}) => ({
+  agent: 'qoder', sessions: 1, events: 3, prompts: 0, toolStarts: 0, toolEnds: 0,
+  toolFailures: 1, interrupts: 1, permissionDenied: 1, turnFailures: 0, openTools: 0,
+  lastEventAt: TIME, ...overrides,
+});
 function fixture() {
   const cpuRows = Array.from({ length: 24 }, (_, index) => ({
     id: `process-${100 + index}-${9000 + index}`, name: `Worker ${index}`, detail: index === 17 ? 'Nested evidence target' : 'normalized process',
@@ -48,6 +58,10 @@ function fixture() {
         { key: 'processes', status: 'available', reason: '' }, { key: 'sessions', status: 'available', reason: '' },
         { key: 'interruptions', status: 'unavailable', reason: 'Source offline' }, { key: 'interruptionCounts', status: 'invalid', reason: 'Bad summary' }, { key: 'latency', status: 'truncated', reason: 'Bounded rows' },
       ],
+      hooks: { status: 'truncated', reason: 'Hook collector bound', skippedLines: 3, agents: [hookAgent()], events: [
+        hookEvent(), hookEvent({ id: '0000000000000002', kind: 'permission_denied', occurredAt: '2026-11-01T11:59:59.000Z', sessionId: 'session/2', interrupt: false }),
+        hookEvent({ id: '0000000000000003', occurredAt: '2026-11-01T11:59:58.000Z', sessionId: 'session/2', interrupt: true }),
+      ] },
       totals: { sessions: 22, inputTokens: 0, outputTokens: 231, unresolved: null, critical: null, high: null },
       findings: [{ severity: 'warning', title: 'Coverage', detail: 'Missing interruptions', suggestion: 'Inspect separately' }],
       processes, sessions, interruptions: [], latency: [{ agent: null, calls: 0, streamingCalls: 0, ttftP95Ms: null, e2eP95Ms: 0, tpsP50: 0, tpotP95Ms: null }, { agent: 'Qoder', calls: 42, streamingCalls: 41, ttftP95Ms: 100, e2eP95Ms: 300, tpsP50: 10, tpotP95Ms: 20 }],
@@ -66,13 +80,13 @@ function deepFreeze(value) {
   return value;
 }
 
-test('catalog exposes all 15 static datasets, full field lists, availability and honest limitations', () => {
+test('catalog exposes all 17 static datasets, full field lists, availability and honest limitations', () => {
   const view = fixture();
   const catalog = datasetCatalog(view);
   assert.equal(catalog.schema_version, '1.0');
   assert.equal(catalog.read_only, true);
   assert.equal(catalog.cache_only, true);
-  assert.equal(catalog.datasets.length, 15);
+  assert.equal(catalog.datasets.length, 17);
   assert.ok(catalog.datasets.every(item => item.cached && item.fields.length > 0 && item.meta.limitations.length > 0));
   const rows = catalog.datasets.find(item => item.name === 'resource-rows');
   assert.equal(rows.detail_id_field, 'queryId');
@@ -128,6 +142,124 @@ test('all Agent process/session/latency and coverage caches remain uncapped by U
   assert.equal(query(view, 'agent-findings').items[0].title, 'Coverage');
 });
 function ownProperty(value, key) { return Object.hasOwn(value, key); }
+
+test('Hook datasets use normalized rows, independent status/reason/skipped count and the report window', () => {
+  const view = fixture();
+  const events = query(view, 'agent-hook-events');
+  assert.deepEqual(events.items, view.agent.hooks.events);
+  assert.equal(events.meta.source, 'agent-hooks');
+  assert.equal(events.meta.status, 'truncated');
+  assert.equal(events.meta.sampled_at, view.agent.sampledAt);
+  assert.deepEqual(events.meta.coverage, { scope: 'agent_hook_metadata', window: view.agent.window, reason: 'Hook collector bound', skippedLines: 3 });
+  for (const key of ['sources', 'report_status', 'outcome', 'lastScanAt', 'filteredProcesses']) assert.equal(events.meta.coverage[key], undefined);
+  const agents = query(view, 'agent-hook-agents');
+  const { id, ...summary } = agents.items[0];
+  assert.deepEqual(summary, view.agent.hooks.agents[0]);
+  assert.match(id, /^agent-hook-agents:/);
+  assert.deepEqual(query(view, 'agent-hook-agents', '', id).item, agents.items[0]);
+  assert.deepEqual(query(view, 'agent-hook-events', '', events.items[0].id).item, events.items[0]);
+  assert.equal(query(view, 'agent-coverage').total, 5);
+  assert.equal(query(view, 'agent-findings').meta.status, 'partial');
+  const catalog = datasetCatalog(view);
+  assert.equal(catalog.datasets.find(item => item.name === 'agent-hook-agents').id_scope, 'snapshot');
+  assert.ok(catalog.datasets.find(item => item.name === 'agent-hook-events').meta.limitations.some(text => text.includes('latest 200')));
+});
+
+test('Hook fields support typed filters, ISO bounds, stable sort, projection, pagination and detail', () => {
+  const view = fixture();
+  assert.deepEqual(query(view, 'agent-hook-events', 'filter.interrupt=null&filter.sessionId=null&fields=id,interrupt,sessionId,model').items,
+    [{ id: '0000000000000001', interrupt: null, sessionId: null, model: 'model v1' }]);
+  assert.equal(query(view, 'agent-hook-events', 'filter.interrupt=false').items[0].kind, 'permission_denied');
+  assert.equal(query(view, 'agent-hook-events', 'filter.interrupt=true').total, 1);
+  assert.equal(query(view, 'agent-hook-events', 'filter.kind=tool_failure&filter.agent=qoder').total, 2);
+  assert.equal(query(view, 'agent-hook-events', 'min.occurredAt=2026-11-01T11:59:59.000Z&max.occurredAt=2026-11-01T12:00:00.000Z').total, 2);
+  assert.equal(query(view, 'agent-hook-events', 'q=code%20reviewer').total, 3);
+  const page = query(view, 'agent-hook-events', 'sort=occurredAt&offset=1&limit=1&fields=id,kind');
+  assert.equal(page.total, 3);
+  assert.equal(page.next_offset, 2);
+  assert.deepEqual(page.items, [{ id: '0000000000000002', kind: 'permission_denied' }]);
+  assert.deepEqual(query(view, 'agent-hook-events', 'fields=id,tool,errorType', page.items[0].id).item,
+    { id: page.items[0].id, tool: 'read_file', errorType: null });
+  assert.equal(query(view, 'agent-hook-agents', 'min.events=3&max.openTools=0&filter.turnFailures=0&fields=agent,events,openTools').total, 1);
+  rejects(view, 'agent-hook-events', 'filter.kind=raw_hook_name');
+  rejects(view, 'agent-hook-events', 'filter.interrupt=0');
+});
+
+test('Hook caches retain the bounded 200 recent events and 16 full-input summaries, not UI limits', () => {
+  const view = fixture();
+  view.agent.hooks.events = Array.from({ length: 200 }, (_, i) => hookEvent({ id: i.toString(16).padStart(16, '0') }));
+  view.agent.hooks.agents = Array.from({ length: 16 }, (_, i) => hookAgent({ agent: `agent-${i}`, events: i === 0 ? 5000 : 0 }));
+  const first = query(view, 'agent-hook-events');
+  assert.equal(first.total, 200);
+  assert.equal(first.items.length, 100);
+  assert.equal(first.next_offset, 100);
+  assert.equal(query(view, 'agent-hook-events', 'limit=1000').items.length, 200);
+  assert.equal(query(view, 'agent-hook-agents', 'limit=1000').items.length, 16);
+  assert.equal(query(view, 'agent-hook-agents', 'sort=-events').items[0].events, 5000);
+  assert.equal(query(view, 'agent-hook-events', '', '00000000000000c7').item.id, '00000000000000c7');
+});
+
+test('empty, unavailable and invalid Hook caches never borrow available AgentSight coverage', () => {
+  const view = fixture();
+  view.agent.status = 'ok';
+  view.agent.coverage.forEach(item => { item.status = 'available'; });
+  for (const status of ['available', 'unavailable', 'invalid', 'truncated']) {
+    view.agent.hooks = { status, reason: `${status} Hook evidence`, skippedLines: status === 'available' || status === 'truncated' ? 0 : null, agents: [], events: [] };
+    for (const name of ['agent-hook-events', 'agent-hook-agents']) {
+      const result = query(view, name);
+      assert.equal(result.meta.status, status);
+      assert.equal(result.total, 0);
+      assert.equal(result.meta.coverage.reason, `${status} Hook evidence`);
+      assert.equal(result.meta.coverage.skippedLines, view.agent.hooks.skippedLines);
+      assert.deepEqual(result.meta.coverage.window, view.agent.window);
+    }
+    assert.equal(query(view, 'agent-coverage').total, 5);
+    assert.equal(query(view, 'agent-processes').meta.status, 'available');
+    assert.equal(query(view, 'agent-findings').meta.status, 'ok');
+  }
+  delete view.agent.hooks; // Older caches do not fabricate available Hook metadata.
+  assert.equal(query(view, 'agent-hook-events').meta.status, 'unknown');
+  assert.equal(query(view, 'agent-hook-events').total, 0);
+  view.agent = null;
+  for (const name of ['agent-hook-events', 'agent-hook-agents']) rejects(view, name, '', 503);
+});
+
+test('Hook querying is disabled-safe, cache-only, detached and restricted to explicit metadata fields', () => {
+  const view = fixture();
+  for (const row of [...view.agent.hooks.events, ...view.agent.hooks.agents]) {
+    row.raw = { prompt: 'secret-prompt', tool_input: 'secret-input', tool_output: 'secret-output' };
+    row.event_id = 'raw-event-id';
+    row.occurred_at = TIME;
+    row.command = 'secret-command';
+    row.path = '/secret-path';
+  }
+  Object.defineProperty(view.agent.hooks, 'raw_snapshot', { get() { throw new Error('Must not read raw Hook evidence'); } });
+  const before = structuredClone(view);
+  deepFreeze(view);
+  for (const name of ['agent-hook-events', 'agent-hook-agents']) {
+    const result = query(view, name);
+    assert.equal(view.status.enabled, false);
+    assert.equal(result.meta.source, 'agent-hooks');
+    assert.doesNotMatch(JSON.stringify(result), /secret-|raw-event-id|raw_snapshot|event_id|occurred_at/);
+    for (const field of ['raw', 'raw.prompt', 'event_id', 'occurred_at', 'command', 'path', '__proto__', 'constructor']) {
+      rejects(view, name, `fields=${field}`);
+      rejects(view, name, `filter.${field}=secret`);
+      rejects(view, name, `sort=${field}`);
+    }
+    assert.equal(query(view, name, 'q=secret-prompt').total, 0);
+    result.items[0].agent = 'changed';
+    result.meta.coverage.reason = 'changed';
+    result.meta.coverage.window.start = 'changed';
+    assert.deepEqual(structuredClone(view), before);
+    assert.equal(query(view, name).meta.coverage.reason, before.agent.hooks.reason);
+    assert.deepEqual(query(view, name).meta.coverage.window, before.agent.window);
+  }
+  const old = query(view, 'agent-hook-agents').items[0].id;
+  const next = structuredClone(view);
+  next.agent.sampledAt = '2026-11-01T14:00:00Z';
+  rejects(next, 'agent-hook-agents', '', 404, old);
+  assert.equal(query(next, 'agent-hook-events', '', view.agent.hooks.events[0].id).item.id, view.agent.hooks.events[0].id);
+});
 
 test('same-field equality is OR, different fields and bounds are AND', () => {
   const result = query(fixture(), 'resource-rows', 'filter.resource=cpu&filter.pid=101&filter.pid=117&filter.cleanable=false&min.usage=1&max.usage=17&sort=-pid&fields=id,pid,starttime,resource');
@@ -242,7 +374,7 @@ test('uncached health/Agent/tasks return 503, while catalog remains usable', () 
   assert.equal(catalog.datasets.find(item => item.name === 'resources').meta.status, 'not_cached');
   assert.equal(catalog.datasets.find(item => item.name === 'resources').cached, false);
   assert.equal(catalog.datasets.find(item => item.name === 'agent-processes').meta.source, 'agentsight');
-  assert.equal(datasetCatalog().datasets.length, 15);
+  assert.equal(datasetCatalog().datasets.length, 17);
   rejects(view, 'resources', 'unknown=1', 400); // validation still runs before cache checks.
 });
 
@@ -474,7 +606,16 @@ function validSchema(value, schema, contract) {
   const types = schema.type ? [].concat(schema.type) : [];
   if (types.length && !types.some(type => type === actual || type === 'integer' && Number.isSafeInteger(value))) return false;
   if (typeof value === 'number' && (schema.minimum !== undefined && value < schema.minimum || schema.maximum !== undefined && value > schema.maximum)) return false;
-  if (typeof value === 'string' && schema.minLength !== undefined && value.length < schema.minLength) return false;
+  if (typeof value === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength || schema.maxLength !== undefined && value.length > schema.maxLength) return false;
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) return false;
+    if (schema.format === 'date-time' && !Number.isFinite(Date.parse(value))) return false;
+    if (schema.pattern && schema.pattern === contract.components.schemas.AgentDiagnostic.properties.hooks.properties.events.items.properties.occurredAt.pattern && new Date(value).toISOString() !== value) return false;
+  }
+  if (actual === 'array') {
+    if (schema.minItems !== undefined && value.length < schema.minItems || schema.maxItems !== undefined && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems && new Set(value.map(item => JSON.stringify(item))).size !== value.length) return false;
+  }
   if (actual === 'object') {
     if ((schema.required ?? []).some(key => !ownProperty(value, key))) return false;
     if (schema.additionalProperties === false && Object.keys(value).some(key => !ownProperty(schema.properties, key))) return false;
@@ -513,7 +654,7 @@ test('OpenAPI 3.1 describes every actual full GET route, Bearer/local security, 
     Object.values(value).forEach(visit);
   };
   visit(contract);
-  assert.equal(contract.components.schemas.DatasetList.oneOf.length, 15);
+  assert.equal(contract.components.schemas.DatasetList.oneOf.length, 17);
   assert.ok(contract.components.schemas.HealthState.properties.resources.properties.cpu.properties.rows.items.properties.starttime);
   assert.ok(contract.components.schemas.AgentDiagnostic.properties.totals.properties.inputTokens);
   assert.ok(contract.components.schemas.Meta.properties.coverage.properties.jobAnalysis.properties.sampleWindowSeconds);
@@ -545,6 +686,82 @@ test('OpenAPI field annotations match the static catalog; all emitted lists/deta
   assert.equal(validSchema(view.state, contract.components.schemas.HealthState, contract), true);
   assert.equal(validSchema(view.agent, contract.components.schemas.AgentDiagnostic, contract), true);
   assert.equal(validSchema(contract, contract.components.schemas.OpenAPI, contract), true);
+});
+
+test('query report schemas require strict bounded Hook evidence and keep five AgentSight coverage entries', () => {
+  const contract = openApiContract();
+  const schema = contract.components.schemas.AgentDiagnostic;
+  assert.ok(schema.required.includes('hooks'));
+  assert.equal(schema.properties.hooks.properties.events.maxItems, 200);
+  assert.equal(schema.properties.hooks.properties.agents.maxItems, 16);
+  assert.equal(schema.properties.findings.maxItems, 527);
+  const valid = fixture().agent;
+  assert.equal(validSchema(valid, schema, contract), true);
+  const invalidators = [
+    report => { delete report.hooks; }, report => { delete report.hooks.skippedLines; },
+    report => { report.hooks.raw = {}; }, report => { report.hooks.status = 'ok'; },
+    report => { report.hooks.skippedLines = -1; }, report => { report.hooks.skippedLines = 1.5; },
+    report => { report.hooks.reason = 'x'.repeat(513); }, report => { report.hooks.agents[0].events = 5001; },
+    report => { report.hooks.agents[0].agent = 'Qoder'; }, report => { report.hooks.events[0].id = 'ABCDEF0123456789'; },
+    report => { report.hooks.events[0].occurredAt = '2026-02-30T12:00:00.000Z'; },
+    report => { report.hooks.events[0].occurredAt = '2026-11-01T12:00:00Z'; },
+    report => { report.hooks.events[0].sessionId = 'not an identifier'; },
+    report => { report.hooks.events[0].model = 'line\nbreak'; },
+    report => { report.hooks.events = Array.from({ length: 201 }, () => hookEvent()); },
+    report => { report.hooks.agents = Array.from({ length: 17 }, () => hookAgent()); },
+    report => { report.coverage.push({ key: 'hooks', status: 'available', reason: '' }); },
+    report => { report.findings = Array.from({ length: 528 }, () => report.findings[0]); },
+  ];
+  for (const invalidate of invalidators) {
+    const report = structuredClone(valid); invalidate(report);
+    assert.equal(validSchema(report, schema, contract), false);
+  }
+});
+
+test('Hook cumulative and AgentSight all_stored report schemas accept totals beyond detail caps and preserve unknowns', () => {
+  const contract = openApiContract();
+  const schema = contract.components.schemas.AgentDiagnostic;
+  const report = fixture().agent;
+  report.hooks.history = {
+    scope: 'cumulative', status: 'available', reason: 'Independent persistent cumulative counters', sampledAt: TIME,
+    range: { start: '2026-10-01T00:00:00.000Z', end: TIME },
+    totals: { sessions: 6001, events: 12000, prompts: 6001, toolStarts: 5001, toolEnds: 998,
+      toolFailures: 0, interrupts: 0, permissionDenied: 0, turnFailures: 0, openTools: 4003 },
+    activity: { events: 0, range: { start: null, end: null }, reason: 'Aggregate enabled after prior rotation',
+      kinds: [], bins: [], sessions: [], tools: [], subagents: [] },
+  };
+  report.hooks.history.activity.kinds = ['session_start', 'session_end', 'prompt_submit', 'tool_start', 'tool_end', 'tool_failure', 'permission_request', 'permission_denied', 'turn_stop', 'turn_failure', 'notification', 'subagent_start', 'subagent_stop', 'task_created', 'task_completed', 'teammate_idle', 'elicitation', 'elicitation_result', 'compact', 'compact_completed'].map(kind => ({ kind, count: 0 }));
+  report.history = {
+    scope: 'all_stored', sampledAt: TIME, status: 'partial',
+    coverage: [{ key: 'usage', status: 'available', reason: '' }, { key: 'sessions', status: 'truncated', reason: 'Response bound' },
+      { key: 'interruptionCounts', status: 'available', reason: '' }],
+    totals: { sessions: null, calls: 12000, inputTokens: 900000, outputTokens: 0, unresolved: 0, critical: 0, high: 0 },
+  };
+  assert.equal(validSchema(report, schema, contract), true);
+  const view = { ...fixture(), agent: report };
+  assert.equal(query(view, 'agent-hook-events', 'limit=1').total, 3);
+  assert.equal(report.hooks.history.totals.events, 12000);
+  assert.equal(query(view, 'agent-sessions', 'limit=1').total, 22);
+  assert.equal(report.history.totals.sessions, null);
+  for (const invalidate of [
+    value => { value.hooks.history.totals.events = Number.MAX_SAFE_INTEGER + 1; },
+    value => { value.hooks.history.totals.events = -1; },
+    value => { value.hooks.history.totals.raw = 'private'; },
+    value => { value.history.totals.calls = 1.5; },
+    value => { value.history.scope = 'lifetime'; },
+    value => { value.history.scope = 'cumulative'; },
+    value => { value.hooks.history.scope = 'all_stored'; },
+    value => { value.history.coverage.push(value.history.coverage[0]); },
+  ]) {
+    const next = structuredClone(report);
+    invalidate(next);
+    assert.equal(validSchema(next, schema, contract), false);
+  }
+  report.hooks.history.status = 'truncated';
+  report.hooks.history.range = { start: null, end: null };
+  report.hooks.history.activity = null;
+  for (const key of Object.keys(report.hooks.history.totals)) report.hooks.history.totals[key] = null;
+  assert.equal(validSchema(report, schema, contract), true);
 });
 
 test('OpenAPI is detached from static field definitions and pure-cache querying remains valid while disabled', () => {

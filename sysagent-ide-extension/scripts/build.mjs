@@ -8,7 +8,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const guard = resolve(root, '../sysagent-idc');
 const dist = resolve(root, 'dist');
 const { version } = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
-const { verifyBundle, REQUIRED_FILES } = createRequire(import.meta.url)(resolve(guard, 'scripts/prepare-sysak.cjs'));
+const require = createRequire(import.meta.url);
+const { verifyBundle, REQUIRED_FILES } = require(resolve(guard, 'scripts/prepare-sysak.cjs'));
+const { buildHookRuntime } = require(resolve(guard, 'scripts/build-openapi.cjs'));
+buildHookRuntime();
 const bundle = resolve(guard, 'resources/sysak');
 verifyBundle(bundle);
 

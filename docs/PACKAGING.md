@@ -1,194 +1,96 @@
 # 打包与安装
 
-当前交付为 **SysAgent 0.2.19 / GX 0.6.5-2 / 独立 AgentSight 0.16.0**。安装者优先阅读[根 README](../README.md)。
+本文说明交付物、构建入口、安装步骤和权限边界。开发流程见[开发说明](./DEVELOPMENT.md)，IDE 的安装与使用见[插件说明](../sysagent-ide-extension/README.md)。构建命令在仓库根目录执行；安装命令在交付目录执行。
 
-## 0.2.19 开源发布件
+## 交付物与用途
 
-在项目根目录执行 `npm run build`（`npm run release` 是同一入口），已有 Node 依赖时可执行 `npm run build -- --skip-install`。入口 [scripts/build.mjs](../scripts/build.mjs) 先做统一版本检查，再准备并校验 sysAK bundle、校验 AgentSight 与 GX 输入并与主 deb 依赖交叉核对、在子项目执行 `npm ci`，然后生成 `release/build-0.2.19/` 中的主 deb、官方未修改 GX deb、AgentSight runtime deb、VSIX、`agentsight-runtime/`、安装脚本、三份许可声明与 `SHA256SUMS`。桌面步骤调用 `build:deb`，**不生成 AppImage**；入口不安装系统服务、不开启采集、不结束进程、不上传发布件。
-
-> **已知构建缺口（当前仓库状态）：** `vendor/sysak/linux-x64/` 仍是旧四命令包（manifest `commands` 为 `idc/resource_anomaly/memgraph/ai`，规则行为 `detect/generic:idc:…`），而 [prepare-sysak.cjs](../sysagent-idc/scripts/prepare-sysak.cjs) 与 deb postinst 都要求 `idc_inspect`。因此 `npm run build`、`build:desktop`、`build:ide`、桌面 `build:deb`/`build:electron`/`verify:sysak` 和 IDE 构建都会在准备 bundle 时失败，报 `prepare:sysak: Missing idc_inspect rule with python-dep{python3}`；只有 `npm run build:web` 不受影响。修复方式是用包含 `idc_inspect` 的 sysAK 构建产物替换 vendor 输入并同步 manifest 的 `commands` 与逐文件哈希，或临时以 `SYSAK_BUNDLE_DIR`／`npm --prefix sysagent-idc run prepare:sysak -- --source <产物目录>` 指向已完成的构建。缺口修复前不能声称发布包构建通过。
-
-主 deb 精确依赖 `gx (= 0.6.5-2)` 与 `sysom-agentsight-runtime (= 0.16.0)`，并声明 GX 需要的 glibc 2.27+、`zlib1g`、`libzstd1`，以及 `python3`、`systemd` 等运行依赖；**不依赖也不安装 sysAK 软件包**。安装脚本用一次 `dpkg --install` 按 GX、AgentSight runtime、主 SysAgent 顺序离线安装三个本地包；缺少系统依赖时由管理员补齐，不能强制跳过。GUI 启动不下载或提权。
-
-资源采集在运行时使用**系统已安装的 sysak**：按 `SYSOM_SYSAK_BIN`（或控制器 `sysakBinary`）→ `/usr/bin/sysak` → `/usr/local/bin/sysak` → `PATH` 解析，并要求组件目录含可读 `tools/idc_inspect` 与匹配的规则行，否则报 `SYSAK_NOT_FOUND`／`SYSAK_COMPONENT_MISSING`，不会联网下载组件。包内 `resources/sysak/` 仍随 deb 与 VSIX 交付并通过 postinst 校验，但当前只作为 AgentSight 采集控制的 `bundleRoot`，不是资源采集的二进制来源。安装 deb 不等于具备资源采集能力，另需系统 sysak。
-
-云端巡检（sysAK 上传步骤 1–4 与桌面步骤 5）依赖 `sysagent-idc/vendor/alicloud-sysom20231230-3.3.2.tgz`，`package.json` 以 `file:` 方式引用，`npm ci` 需要该 tarball 在位。SysOM 凭据只经环境变量提供，不写入源码、包内配置或发布件；未配置时应用保持纯本地模式。
-
-安装后 GX 辅助程序验证已配置版本和可信文件，为 `/usr/lib64` 注册动态库路径并运行 `ldconfig`；不会把 GX 自带的通用 ELF/DWARF 库加入全局搜索路径。真实 GPU 诊断仍取决于硬件和驱动，版本与依赖加载验证不等于硬件功能认证。
-
-此前 0.2.19 批次单独重编译 SysAK 的原生 `ai`，使用既有 SysAK 构建镜像、Rust/Cargo 1.77.0、GCC 9.3.1，保留原 Cargo.toml/Cargo.lock，执行 `cargo build --locked --release --bin ai --lib -j2`。该批次仅更新 vendor 中 `ai` 的二进制与 manifest 哈希，其他 SysAK 输入和 AgentSight 不重新编译；官方 GX 包不修改。独立 `ai` 不依赖 coolbpf `CollectionFramework`。执行追踪确认新 `ai` 调用 `/usr/bin/gx diag`，无 GPU/驱动返回有效 JSON；不能将其当作 GPU 硬件成功路径，也不代表当前 `idc_inspect` 迁移后的完整包验收。
-
-此前批次另附 `sysagent-source-0.2.19.tar.gz` 源码快照及 `release/SysAgent-0.2.19-linux-x64-offline.tar.gz` 发布归档。它们**不是标准构建入口的产物**；当前迁移后的归档交付需在构建成功后另行组包并逐文件校验，不能沿用旧批次验收。
-
-## 配置与源码（当前）
-
-- [package.json](../sysagent-idc/package.json)：Electron Builder 配置与 npm 脚本；`build.linux.target` 仍列 `AppImage` 与 `deb`，但根入口只走 `build:deb`。
-- [package-lock.json](../sysagent-idc/package-lock.json)：锁定 Node 依赖，含 `file:vendor/alicloud-sysom20231230-3.3.2.tgz`。
-- [build/after-install.sh](../sysagent-idc/build/after-install.sh)：deb postinst。校验包内 sysAK bundle 的 24 个文件、manifest `commands`（`idc_inspect/resource_anomaly/memgraph/ai`）、逐文件 SHA-256、ELF 架构、python3 入口与规范化规则行；设置 root 所有权与普通用户可执行权限；运行 GX 辅助程序；用 `update-alternatives` 注册 `/usr/bin/sysagent-idc`；安装 `/etc/systemd/system/sysom-idc.service` 与 `/etc/sysom-idc/allowed-uid`，仅在存在已授权普通用户 UID 且 systemd 处于 running/degraded 时 `enable` 并 `restart`。要求 python3 具备 `os.pidfd_open`。
-- [build/sysom-idc.service](../sysagent-idc/build/sysom-idc.service) 与 [build/sysak-root-runner.py](../sysagent-idc/build/sysak-root-runner.py)：root 辅助服务，**当前只接受 AgentSight 采集控制请求**（argv `idc --agent-collection {status|ensure|disable}`）；资源采集与进程操作已降到当前用户，不再经该服务。
-- [build/install-debs.sh](../sysagent-idc/build/install-debs.sh)：安装入口模板，构建时替换 `@GX_VERSION@`、`@AGENTSIGHT_VERSION@`、`@SYSOM_VERSION@`；`--enable-agent-collection` 需要 sudo 或显式 `SYSOM_IDC_UID`。
-- [public/icon.svg](../sysagent-idc/public/icon.svg)、[build/icon.png](../sysagent-idc/build/icon.png)、[build/icons/](../sysagent-idc/build/icons/)、[public/icon.png](../sysagent-idc/public/icon.png)：浅蓝小管家形象与 16–1024 像素系统图标；`linux.icon` 指向 `build/icons`。
-- 桌面入口 `StartupWMClass` 必须等于窗口 WM_CLASS `sysagent-idc`，否则 Ubuntu Dock 无法匹配入口，会显示通用齿轮图标。
-- [build/make-icon.cjs](../sysagent-idc/build/make-icon.cjs)：用 Chrome 与 sysagent-analysis 的 Puppeteer 把 SVG 渲染成 PNG；正常打包直接使用已有图标。修改矢量图标后先在 `sysagent-analysis` 执行 `npm ci`，再在 `sysagent-idc` 执行 `npm run icon`，不需要 Python 或 Pillow。
-
-`homepage` 使用应用自身的本地协议入口，维护者字段为本地构建标识，不代表公开网站或对外支持邮箱。旧 FastAPI Demo 骨架不是真实诊断后端。
-
-> **AgentSight 采集控制尚未适配（未验证）：** 控制器仍以 `sysak idc --agent-collection <action>` 调用包内 sysak，root 辅助程序也只放行这一组 argv；而合并后的 sysAK 只有 `idc_inspect`（支持 `--profile`、`--process-action`、`--upload-report`），源码中没有 `--agent-collection`，随仓库的旧 vendor `idc` 组件同样不含该参数。因此这条控制链路对当前 sysAK 不可用，`--enable-agent-collection` 的实际效果本次没有验证。修复需要单独适配 sysAK 侧命令与 root 放行清单，不在文档对齐范围内。
-
-## 构建（当前）
-
-统一入口在项目根目录执行：
-
-```bash
-npm run build            # 三个 deb + VSIX
-npm run build:desktop    # 主 deb + GX deb + AgentSight runtime deb
-npm run build:ide        # 仅 VSIX
-npm run build:web        # 仅网页生产构建，不下载 Electron
-```
-
-单独构建子项目时（同样受上述 sysAK bundle 缺口约束）：
-
-```bash
-cd sysagent-idc
-npm ci
-npm run build:deb        # 或 build:electron（按 linux.target 另出 AppImage）
-cd ../sysagent-ide-extension
-npm run typecheck && npm run build
-```
-
-网络访问 GitHub 较慢或不可用时，桌面可用 `npm run build:electron:mirror`，或在 `npm ci` 前设置 `ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/`；根入口默认使用 npmmirror 的 Electron 与 Electron Builder 镜像，可用同名环境变量覆盖。这些方式只经环境变量选择镜像，不修改系统或 npm 全局配置。
-
-产品版本统一来自根目录 [package.json](../package.json)（当前 **0.2.18**），由 `npm run check:versions` 校验、`npm run sync:versions` 同步桌面与 IDE 的清单和 lockfile；不要单独修改子项目版本。AgentSight 独立保持 0.16.0。共享页面改动后需分别构建桌面和 IDE，不能只重打 runtime 或沿用旧 UI 发布件。IDE 的 [scripts/build.mjs](../sysagent-ide-extension/scripts/build.mjs) 会校验并复制 `sysagent-idc/resources/sysak/` 到 `dist/sysak/`，因此 VSIX 构建同样依赖该 bundle 就绪。
-
-## 安装 deb（当前）
-
-在包含三个 deb、`install-debs.sh` 与 `SHA256SUMS` 的 `release/build-0.2.18/` 目录，彻底退出旧 SysAgent 与 IDE 客户端，再以将要使用应用的普通用户执行：
-
-```bash
-sha256sum --check SHA256SUMS
-sh ./install-debs.sh
-sysagent-idc
-```
-
-安装入口需要管理员授权，离线安装三个本地包，不联网下载，同版本也重新安装。缺依赖时由管理员补齐后重新执行，不自动补齐或回滚，不要只装主 deb。资源采集另需系统 sysak（见上文）。真实主机级 Agent 调用采集需另行显式执行 `sh ./install-debs.sh --enable-agent-collection`，普通安装不开启；该开关的实际效果受上述未适配问题影响，本次未验证。
-
-也可在 Ubuntu 应用菜单打开“SysAgent管家”。已安装的应用在 `/opt/SysAgent管家`，移动源码不影响它。GUI/IDE 以普通用户运行，构建和普通运行验收不需要 sudo。升级前先完全退出旧版（最小化不等于退出，可右键桌面小管家选择“退出”）；安装后重新启动，已有进程不会自动换成新版本或新图标，Dock 仍显示旧齿轮图标时注销并重新登录一次即可刷新。
-
-## 发布前检查（当前）
-
-桌面与 IDE 必须分别构建，组包后再核对元信息与批次校验清单：
-
-```bash
-npm test                 # 根目录：构建流程与 GX 包测试
-npm run test:api         # 根目录：只读查询/API 回归
-npm run check:versions
-cd sysagent-idc && npm test && sh -n build/after-install.sh
-cd ../sysagent-ide-extension && npm run typecheck && npm run build
-dpkg-deb --info release/build-0.2.18/sysagent-idc_0.2.18_amd64.deb
-cd release/build-0.2.18 && sha256sum --check SHA256SUMS
-```
-
-**0.2.18 迁移后实际验证：** 桌面 `npm run build` 退出 0；`sysom-client` 与 `idc-controller` 定向回归 220/220 通过；经显式授权的预发全链路实测走通上传与取报告（`partial_completed`、`reportStatus=Success`、Critical、10 项中 5 项异常），并在隔离端口 5174 的开发网页核对了云端结论、报告弹窗与刷新文案。该次**未重新安装软件、未重跑完整发布包构建**（vendor sysAK 缺口），应用全量测试仍有两项已知环境问题（`health-score` 缺参考夹具、`sysak-package` 15 s 超时偶发），因此不声称全量通过，也不沿用历史批次的验收数量或哈希。
-
-## 0.2.17 及早期历史记录
-
-以下配置、产物路径与测试数字保留为历史记录，不作为 0.2.18 的当前安装入口或验收结论；旧版本输出可能已清理。当前入口、组成与检查见上文各节。历史小节中指向 `release/`、`sysagent-idc/release/` 与 `sysagent-ide-extension/release/` 的校验和及批次清单链接是历史引用，这些生成目录已被清理且不在源码仓库中，链接目标当前不存在。
-
-## 配置与源码（0.2.17 及早期历史）
-
-- [package.json](../sysagent-idc/package.json)：Electron Builder 配置和 npm 脚本。
-- [package-lock.json](../sysagent-idc/package-lock.json)：锁定 Node 依赖。
-- [build/after-install.sh](../sysagent-idc/build/after-install.sh)：deb 安装后注册启动命令、设置 Chromium 沙箱权限、刷新桌面菜单。
-- [public/icon.svg](../sysagent-idc/public/icon.svg)：浅蓝色 SysAgent 小管家 Logo，带淡蓝圆环与绿色状态点；系统应用与窗口图标使用此形象，主页、标题栏与关于窗口也使用同款小管家形象。
-- [build/icon.png](../sysagent-idc/build/icon.png)：1024 × 1024 透明背景小管家图标原图。
-- [build/icons/](../sysagent-idc/build/icons/)：16–1024 像素系统图标，供 Dock、应用列表等使用；`linux.icon` 指向此目录。
-- 桌面入口 `StartupWMClass` 必须等于窗口 WM_CLASS `sysagent-idc`，否则 Ubuntu Dock 无法匹配入口，会显示通用齿轮图标。
-- [public/icon.png](../sysagent-idc/public/icon.png)：同款 Electron 窗口图标，由 Vite 复制到 dist。
-- [build/make-icon.cjs](../sysagent-idc/build/make-icon.cjs)：使用 Google Chrome 和 sysagent-analysis 的 Puppeteer 将 SVG 渲染成 PNG；正常打包直接使用已有图标，不需重新生成。
-
-修改矢量图标后，先在 `sysagent-analysis` 运行 `npm ci`，再在 `sysagent-idc` 运行 `npm run icon`。图标生成不需要 Python 或 Pillow。
-
-当时的主 SysAgent deb 包含桌面应用和经 root 服务执行的系统资源采集，并依赖独立 AgentSight runtime deb；完整离线包另含 AppImage、VSIX 与 `agentsight-runtime/`。AppImage/VSIX 不自行安装系统采集服务，VSIX 不内嵌 AgentSight 二进制；不把旧 FastAPI Demo 骨架作为真实诊断后端。0.2.18 的组成与此不同：资源采集改用当前用户直接调用系统 sysak，root 服务只保留 AgentSight 采集控制，根入口不再生成 AppImage，见上文各节。
-
-## 构建（0.2.17 及早期历史）
-
-```bash
-cd sysom_idc/sysagent-idc
-npm ci
-npm run build:electron
-```
-
-网络访问 GitHub 较慢或不可用时：
-
-```bash
-npm run build:electron:mirror
-```
-
-该脚本通过环境变量选择 Electron 与 Electron Builder 工具的 npmmirror 镜像，不修改系统或 npm 全局配置。
-
-如果连 `npm ci` 中的 Electron 下载也较慢，可运行：
-
-```bash
-ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm ci
-```
-
-从 0.2.5 起，产品版本统一来自根目录 `package.json`（当时路径为 `sysom_idc/package.json`），不要单独修改桌面或插件版本；当时根目录、桌面及 IDE 清单/lockfile 使用 0.2.17，AgentSight 独立保持 0.16.0。当前统一版本为 0.2.18，见上文。共享页面改动后需分别构建桌面和 IDE，不能只重打 runtime 或沿用旧 UI 发布件。
-
-早期 `npm --prefix sysom_idc run release` 是 Demo 统一发行流程，生成 deb、AppImage、离线 HTML、VSIX 与 `release-<version>.json`；它不是当前真实版离线包安装入口，也不能用其历史通过记录代替本轮验证。本批次在下述独立目录组包，校验、运行验证完成后才清理旧发布文件；历史记录保留。打包不自动安装、提交或上传，不覆盖已完成批次。
-
-## 0.2.17 批次产物（历史）
-
-当时批次目录为 `sysom_idc/sysagent-idc/release/idc-0.2.17-sysagent-20261113/`，交付清单：
+根目录 `npm run build` 与 `npm run release` 使用同一入口 `scripts/build.mjs`，完整目标输出到 `release/build-0.2.19/`：
 
 ```text
-idc-0.2.17-sysagent-20261113/
-├── SysAgent管家-0.2.17-linux-x64-offline.tar.gz
-├── sysagent-idc_0.2.17_amd64.deb
+release/build-0.2.19/
+├── sysagent-idc_0.2.19_amd64.deb
+├── gx_0.6.5-2_amd64.deb
 ├── sysom-agentsight-runtime_0.16.0_amd64.deb
-├── SysAgent管家-0.2.17.AppImage
-├── sysagent-ide-0.2.17.vsix
-├── install-debs.sh
+├── sysagent-ide-0.2.19.vsix
+├── sysagent-qoder-plugin-0.2.19.zip
+├── sysagent-qoder-ide-plugin-0.2.19.zip
 ├── agentsight-runtime/
-└── SHA256SUMS
+├── install-debs.sh
+├── SHA256SUMS
+├── LICENSE
+├── THIRD_PARTY_NOTICES
+└── FONT_LICENSE
 ```
 
-离线包包含本批次安装件与校验清单，不含系统依赖仓库；安装入口不联网下载。不要只交付主 deb、遗漏 runtime，或把旧 Demo HTML 当成真实版入口。AppImage 需同目录独立 runtime 或已安装 runtime deb；完整系统资源功能仍需两个 deb。
+| 交付物 | 用途与边界 |
+| --- | --- |
+| 主 SysAgent deb | 桌面应用、包内 sysAK bundle 和受限的 AgentSight 采集控制辅助服务；不安装系统 sysak |
+| GX deb | 官方未修改的 GPU 原生运行时；真实诊断还取决于硬件与驱动 |
+| AgentSight runtime deb | 独立程序与部署辅助工具；安装不等于开启主机级采集 |
+| VSIX | VS Code API 兼容 IDE 的面板与状态栏；不内嵌 AgentSight 二进制，不安装系统服务 |
+| 两个 Hook ZIP | 分别供 Qoder 独立应用／CLI 和 Qoder IDE 手动导入，记录白名单事件元数据 |
+| `agentsight-runtime/` | 独立配套目录，含程序、完整性清单、部署工具与其许可 |
+| 安装脚本与校验清单 | 离线安装三个 deb、校验交付目录中的文件 |
 
-真实主机采集默认关闭，必须显式 `sh ./install-debs.sh --enable-agent-collection` 接受主机级明文/参数及本地完整会话保存；匹配规则不是严格进程隔离，`traceEnabled:false` 不是本地数据库脱敏。只有 trace 服务获得包括权限较大的 `CAP_SYS_ADMIN` 在内的采集能力，API/GUI/IDE 不获得。托管数据库合计 50 MiB 是周期性软清理目标，不是硬配额；WAL、忙锁和空页可使占用超出。停用保留历史，不自动发起模型调用。
+标准根入口不生成 AppImage、源码 tarball、离线 HTML 或 `validation.json`。打包不会安装系统服务或插件、开启采集、结束进程、提交代码或上传发布件。
 
-## 历史 Demo 产物说明
+## 构建环境与输入
 
-0.2.6 的输出位置（历史记录，不作为当前安装入口）：以下目录使用改名后的工作目录路径，历史产物文件名保留原名；旧文件不因文档名称更新而被重命名，也不保证仍可获取。
+- 根入口要求 Node.js 20+、npm；开发可使用 Node.js 22 或 24。
+- 桌面与 VSIX 原生构建要求 Linux x86_64；桌面打包需要 `dpkg-deb`。网页和静态 Hook ZIP 有独立目标。
+- 首次安装 Node 依赖需要网络；已有完整依赖时可用 `--skip-install`。构建输入应完整保留在源码树中。
+- `vendor/sysak/linux-x64/` 含 `idc_inspect`。原生目标将其准备到 `sysagent-idc/resources/sysak/` 并校验组件、规则、架构与逐文件摘要；VSIX 构建校验后复制到 `dist/sysak/`。
+- `vendor/agentsight/linux-x64/` 与 `vendor/gx/linux-x64/` 提供桌面交付输入，入口核对完整性与主 deb 的精确依赖。
+- `sysagent-idc/vendor/alicloud-sysom20231230-3.3.2.tgz` 是云端巡检 SDK 的本地依赖，执行 `npm ci` 时必须在位。
+
+根入口默认通过环境变量选择 npmmirror 的 Electron 与 Electron Builder 下载镜像。可设置 `ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR` 指定镜像，不需要修改 npm 全局配置；镜像不免除完整性和依赖检查。
+
+## 构建入口
+
+```bash
+npm run build                 # 完整交付目录
+npm run release               # 与 build 相同
+npm run build -- --skip-install
+npm run build:desktop         # 三个 deb、runtime 目录、安装脚本、许可与校验清单
+npm run build:ide             # VSIX、许可与校验清单
+npm run build:web             # sysagent-idc/dist/ 网页生产构建
+npm run build:qoder           # 两个静态 Hook ZIP 与校验清单
+```
+
+也可使用 `npm run build -- --target ide` 选择目标；`--target` 的取值为 `all`、`desktop`、`ide`、`web` 或 `qoder`。原生目标准备 sysAK bundle；网页目标不下载 Electron；Qoder 目标只需要 Node，不安装依赖、不准备 sysAK、不构建前端、不执行 Hook。
+
+单独构建子项目：
+
+```bash
+npm --prefix sysagent-idc ci
+npm --prefix sysagent-idc run build:deb
+npm --prefix sysagent-ide-extension ci
+npm --prefix sysagent-ide-extension run typecheck
+npm --prefix sysagent-ide-extension run build
+npm --prefix sysagent-ide-extension run package
+```
+
+IDE 需要桌面子项目的共享依赖与已准备的 sysAK bundle；根 `build:ide` 处理这些前置步骤。子项目 `build` 是编译，`package` 才输出 VSIX。桌面子项目 `build:electron` 按其 Linux 打包目标执行，可能生成 AppImage；它不是标准三 deb 交付入口。
+
+`npm run check:versions` 检查根项目、桌面、IDE 与两个 Hook 插件的清单一致性，`npm run sync:versions` 同步受管理清单与 lockfile；AgentSight 使用独立的运行时依赖标识。共用页面或宿主逻辑需要分别编译桌面与 IDE，不手工修改生成目录。
+
+## 运行依赖与 sysAK 来源
+
+完整本机能力要求 Linux x86_64、兼容图形环境与原生库；配套 AgentSight 要求 glibc 2.38+。主 deb 精确依赖 `gx (= 0.6.5-2)`、`sysom-agentsight-runtime (= 0.16.0)`，并声明 `python3`、`systemd`、`zlib1g`、`libzstd1` 等系统依赖；GX 自身要求 glibc 2.27+。安装辅助服务要求 Python 具备 `os.pidfd_open`（通常 Python 3.9+）及可用 Linux pidfd（通常内核 5.3+）。缺少依赖时由管理员准备，不强制忽略依赖。
+
+系统资源采集以当前普通用户运行系统已安装的 sysak：
 
 ```text
-sysom_idc/
-├── sysagent-idc/release/
-│   ├── SysOM管家-0.2.6.AppImage
-│   ├── sysom-guard_0.2.6_amd64.deb
-│   ├── SysOM管家-0.2.6-demo.html
-│   ├── SHA256SUMS-0.2.6
-│   └── linux-unpacked/
-├── sysagent-ide-extension/release/
-│   ├── sysom-ide-0.2.6.vsix
-│   └── SHA256SUMS-0.2.6
-└── release/
-    ├── release-0.2.6.json
-    └── SHA256SUMS-0.2.6
+SYSOM_SYSAK_BIN → /usr/bin/sysak → /usr/local/bin/sysak → PATH
 ```
 
-0.2.6 新增本机 GPU 只读识别：无 GPU 时隐藏诊断页面、首页卡片、体检项、性能标签和告警选项；支持用 `SYSOM_GPU=0|1` 手动指定，纯浏览器可用 `?gpu=0|1`。Linux 无 DRM render 节点时关闭 Chromium 硬件加速，避免 GPU 初始化报错，不绕过沙箱。
+控制器显式注入的 `sysakBinary` 优先于环境变量。指定覆盖路径时只检查该路径，不静默回退。组件目录优先使用二进制 realpath 同目录的 `.sysak_components/`，否则使用 `/usr/local/sysak/.sysak_components/`；必须有可读的 `tools/idc_inspect` 和匹配规则。缺失时返回 `SYSAK_NOT_FOUND` 或 `SYSAK_COMPONENT_MISSING`，不会下载组件。
 
-0.2.6 的系统应用（含 Ubuntu Dock 与应用列表）、窗口、标题栏、主页健康中心与关于窗口统一使用浅蓝悬浮小管家 Logo（淡蓝圆环与绿色状态点）。启动直达主页，最小化或关闭主页后显示可拖动的原生桌面小管家；模拟新异常会抖动提示。右键小管家选择“退出”才能完全退出。业务操作仍为模拟，FastAPI 骨架未接入。
+资源命令为 `sysak idc_inspect --request-id <UUID> -o -`，要求采集协议 `schema_version = "1.1"`、`collection.profile = "inspection"`。包内 bundle 只供采集控制使用，不作为资源采集的二进制来源。主 deb 不安装 sysak，安装成功不保证系统资源采集可用。
 
-单文件离线版由 `npm run build:html` 单独生成，只能在浏览器内模拟桌面效果，不具备原生浮窗。原始参考 demo 保持不变。
+## 安装与启动
 
-`linux-unpacked/` 是完整的 Electron 应用目录，不要只复制其中的主可执行文件；AppImage 和 deb 是可单独交付的打包文件。
-
-0.1.0 保留为历史交付版本，它的默认安装脚本会错误地依赖 root 的 user namespace 探测来决定沙箱权限。0.1.1 使用专用安装脚本设置 root 所有权和 `4755` 权限，避免 Ubuntu 桌面 AppArmor 限制导致的启动失败。
-
-## 安装 deb（0.2.17 历史入口）
-
-将 `SysAgent管家-0.2.17-linux-x64-offline.tar.gz` 解压到空目录，彻底退出旧 SysAgent 和 IDE 客户端，再以将要使用应用的普通用户在解压目录执行：
+在交付目录中先完全退出 SysAgent 与使用插件的 IDE；最小化不等于退出。以实际使用应用的普通用户执行：
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -196,154 +98,81 @@ sh ./install-debs.sh
 sysagent-idc
 ```
 
-安装入口需要管理员授权，通过 `dpkg --install` 安装两个本地 deb；不联网下载，同版本也重新安装。缺依赖时由管理员补齐后重新执行，不自动补齐或回滚，不推荐单装主 deb。真实主机采集需另行显式授权上述开关，普通安装不开启。
+安装入口请求管理员授权，用一次 `dpkg --install` 按 GX、AgentSight runtime、主 SysAgent 顺序安装三个本地 deb，不联网下载。缺系统依赖时不会自动补齐或回滚，应由管理员补齐后重新执行。不要只安装主 deb。
 
-也可在 Ubuntu 应用菜单打开“SysAgent管家”。已安装的应用在 `/opt/SysAgent管家`；移动源码不影响它。GUI/IDE 以普通用户运行；构建和普通运行验收不需要 sudo。
+应用安装到 `/opt/SysAgent管家`，可从 Ubuntu 应用菜单打开“SysAgent管家”。GUI 与 IDE 必须以普通用户运行；运行发布件不需要 Node、npm、Rust 或 Python 开发后端。GUI 启动不下载组件或提权。
 
-升级前先完全退出旧版；最小化不等于退出，0.2.1 及以后版本可右键桌面小管家选择“退出”。安装后重新启动，已有进程不会自动换成新版本或新图标；若 Dock 仍显示旧的齿轮图标，注销并重新登录一次即可刷新。
+VSIX 和 Hook ZIP 分别在相应客户端手动导入；安装 deb 不注册插件。安装完成后启动应用或重载 IDE，不需要同时运行桌面与 IDE。
 
-## AppImage（历史产物，当前根入口不生成）
+### 安装产生的系统操作
 
-带 FUSE 2 的环境可以直接运行 AppImage。Ubuntu 环境缺少 `libfuse.so.2` 时，无需修改系统也可执行：
+`sysagent-idc/build/after-install.sh` 在包管理器的 root 安装阶段：
 
-```bash
-APPIMAGE_EXTRACT_AND_RUN=1 "sysom_idc/sysagent-idc/release/idc-0.2.17-sysagent-20261113/SysAgent管家-0.2.17.AppImage"
+- 校验包内 sysAK 文件白名单、manifest、逐文件 SHA-256、ELF 架构、Python 入口与规范化规则，拒绝不安全所有权、链接或可写路径。
+- 设置资源的 root 所有权与普通用户读取／执行权限，不给 sysAK 或应用主程序设置 SUID。
+- 运行 GX 辅助程序核对可信文件，为 `/usr/lib64` 注册动态库路径并执行 `ldconfig`；GX 自带的通用 ELF／DWARF 库不加入全局搜索路径。
+- 通过 `update-alternatives` 注册 `/usr/bin/sysagent-idc`，部署受限辅助服务与普通用户 UID 授权。仅在有效授权 UID 存在、systemd 处于 running／degraded 时启动该辅助服务；其运行不代表 AgentSight trace 已开启。
+- 仅对安装目录内的 `chrome-sandbox` 设置 root 所有权和 `4755` 权限，并刷新桌面菜单及图标缓存。
+
+不要用 sudo 启动 GUI／IDE，不禁用 Chromium 沙箱、AppArmor 或完整性校验，不递归设置 SUID。Dock 图标匹配要求 `StartupWMClass` 与窗口 WM_CLASS 均为 `sysagent-idc`；缓存未刷新时可注销后登录。
+
+## AgentSight 主机级采集：授权与限制
+
+默认安装不启用主机级真实调用采集。资源采集、普通 AgentSight API 服务和主机级 trace 是不同链路；API 可用、出现已有数据或安装成功都不能证明 trace 正在采集。
+
+安装脚本提供显式授权参数 `sh ./install-debs.sh --enable-agent-collection`，要求通过 sudo 提供普通用户身份，或显式设置 `SYSOM_IDC_UID`。它表达主机级采集的授权意图，不能作为启用成功的证据。控制器发送 `idc --agent-collection {status|ensure|disable}` 兼容请求，root 辅助服务将其映射到固定 AgentSight 控制脚本，不由 `idc_inspect` 执行。应核对可信安装、授权、systemd、内核能力、真实服务状态与数据覆盖，不以安装或 API 连通推断采集成功。
+
+评估主机级采集时必须理解：
+
+- 可能捕获其他进程的明文、参数和完整会话并保存到本地。Agent 匹配规则不是严格进程隔离；多用户或敏感主机应保持关闭。
+- `traceEnabled:false` 不代表本地数据库已脱敏。回环 AgentSight API 不应当作多用户鉴权隔离边界。
+- 托管方案的 trace 服务具有 eBPF／perf 所需 capabilities，包含权限较大的 `CAP_SYS_ADMIN`；API、桌面和 IDE 不获得此能力。
+- 托管数据目录为 `/var/lib/sysom-agentsight/<UID>`，API 使用回环端口 7397；普通独立部署使用 7396。显式独立部署优先，已有用户配置不由应用改写。
+- 托管数据库合计 50 MiB 是周期性软清理目标，不是硬配额；WAL、忙锁与空页会使占用超出。该目标不适用于 Hook 的独立累计数据库。
+- 退出 GUI／IDE 不等于停用独立 trace，停用保留已有数据，不自动发起模型调用。管理员可使用配套工具的 `disable` 操作停用托管采集，并核对实际服务状态。
+
+## Qoder Hook ZIP 的导入与运行
+
+| 客户端 | ZIP | 事件覆盖 |
+| --- | --- | --- |
+| Qoder 独立应用／CLI | `sysagent-qoder-plugin-0.2.19.zip` | 20 个独立注册事件 |
+| Qoder IDE | `sysagent-qoder-ide-plugin-0.2.19.zip` | 12 个事件，含 `Notification` |
+
+ZIP 是事件插件，VSIX 是诊断界面。校验摘要后通过客户端插件界面手动导入对应 ZIP；Qoder IDE 的 Hook 配置不热加载，导入后重启客户端。打包不安装、注册、启用、上传插件或修改用户设置。Hook 要求 Linux、Python 3.6+，仅使用标准库。
+
+两个 ZIP 都直接以插件文件作为根布局：
+
+```text
+.qoder-plugin/plugin.json
+hooks/hooks.json
+bin/sysagent_hook.py
+lib/sysagent_hooks/
+LICENSE
 ```
 
-AppImage 已有执行权限。复制到其他机器后若执行权限丢失，再为该 AppImage 添加执行权限即可。
+静态打包器使用纯 Node ZIP32 实现，不调用外部打包命令或网络；固定条目时间与权限，相同源内容产生相同 ZIP。只选插件文件与共享 Python 源码，排除测试、缓存、依赖、用户设置、凭据和 spool，拒绝所选路径中的符号链接。两个变体先完成校验与内存生成再写出；IDE 变体校验事件与命令字段、显式 1–30 秒超时和非阻断命令结尾。
 
-## 旧版沙箱错误
+插件只记录 metadata-only 白名单字段，不保存正文、提示词、`cwd`、`tool_input`、`tool_output` 或错误正文。只有 `SessionStart` 同步查询本机 `/api/v1/summary` 缓存并注入短摘要；其他 Hook 为异步。缓存 GET 不触发采集或上传，摘要可能过期，失败不阻断 Agent。
 
-若旧版提示 `setuid_sandbox_host.cc` 和 `mode 4755`，优先按当前三 deb 入口升级到 0.2.18（见上文）；也可只修复指定的沙箱辅助程序：
+共享 spool 为 `~/.local/state/sysagent/agent-hooks/`，绝对路径 `XDG_STATE_HOME` 可覆盖基目录。目录／文件为 0700／0600；不安全权限、所有权和符号链接被拒绝，运行时不修权限。明细 `events.jsonl` 达到约 1 MiB 时轮转为 `events.1.jsonl`；`history.sqlite3` 独立持久累计，不受明细轮转影响，也不受 AgentSight 的 50 MiB 软目标管理。
 
-```bash
-stat -c '%U:%G %a %n' "/opt/SysAgent管家/chrome-sandbox"
-sudo chown root:root "/opt/SysAgent管家/chrome-sandbox"
-sudo chmod 4755 "/opt/SysAgent管家/chrome-sandbox"
-sysagent-idc
-```
+Qoder 独立应用与 IDE 的用户级插件可能重复启用。共用同一 spool 的运行时在文件锁下按 Agent 家族、原生事件及非空载荷进行 HMAC 指纹去重：私有 `.dedup-key` 为 32 字节，`.dedup` 最多 256 项、窗口 5 秒，只在记录追加后提交身份，不保存载荷正文。密钥或账本不可用时不修权限，允许继续记录，因此可能重复；空／无效载荷和不同 spool 不去重。同一窗口内完全相同且无独立发生标识的合法事件也无法区分。
 
-只对这个安装目录中的 Chromium 沙箱辅助程序设置该权限，不要递归设置 SUID，不要给应用主程序设置 SUID，也不要为了启动应用关闭 AppArmor 或系统安全策略。
+Linux `/proc` 的有界父进程识别使用可信可执行名称 `qoder`／`qoder-ide` 标注实际宿主；无法识别时保留插件标签，不保存可执行路径或环境值。去重不扩大各插件的注册范围，也不关联 AgentSight Session ID／PID。无 Hook 数据时来源显示不可用，不影响 AgentSight 五项覆盖。
 
-## 0.2.17/0.2.16 构建内容与发布前检查（历史）
+## 检查与许可
 
-0.2.17 前置结论与按类型归组的问题，直接跳转只读证据；“数据范围”仅保留时间和覆盖状态，不展示内部部署说明或原始错误。进程探活支持名称/PID、角色/状态过滤和每页 20 条分页，筛选或刷新回第一页，本地交互不追加采集或影响 KPI。会话与 Token 显式包含辅助调用，与延迟口径一致；输入已含缓存用量，报告缓存 60 秒后重采集，拒绝窗外会话。Token 为已记录用量，旧记录缺失 usage 可能已存为 0，不能可靠恢复或宣称完整消耗；截断列表总数仍未知。保留四视图、真实延迟、证据与已有会话跳转，停用保留历史、失败标记旧结果；不取正文或自动操作，不发起付费调用。
-
-0.2.17 当时双端构建成功，隔离 AppImage 原生验收 30/30、IDE 原生验收 24/24 通过。这些数量绑定当时的发布包，不适用于 0.2.18，也不沿用历史哈希；当前验证状态见上文“发布前检查（当前）”。
-
-**0.2.16 历史验证（不是 0.2.17 结果）：** 双端类型检查、独立构建及打包通过，1,372 项定向回归通过（包含 30 项 UI 交互测试）；不是全量历史测试套件通过声明。当时浏览器分页/过滤/证据与空数据恢复验证通过，AppImage 原生验收 30/30、IDE VSIX 原生验收 24/24 通过。以下保留维护者检查步骤，桌面和 IDE 必须分别构建：
+维护者准备好依赖后可执行以下检查；结果应独立判断，不以打包成功替代运行能力核对：
 
 ```bash
-cd sysom_idc/sysagent-idc
 npm test
-npm run build
-sh -n build/after-install.sh
-cd ../sysagent-ide-extension
-npm run typecheck
-npm run build
+npm run test:api
+npm run check:versions
+npm --prefix sysagent-idc test
+sh -n sysagent-idc/build/after-install.sh
+npm --prefix sysagent-ide-extension run typecheck
 ```
 
-组包后，从 `sysom_idc` 的上级目录检查两个 deb 的元信息与批次校验清单：
+组包后在交付目录使用 `dpkg-deb --info` 检查三个 deb 的依赖与架构，并执行 `sha256sum --check SHA256SUMS`。测试依赖与限制见[开发说明](./DEVELOPMENT.md#测试与调试)。
 
-```bash
-dpkg-deb --info sysom_idc/sysagent-idc/release/idc-0.2.17-sysagent-20261113/sysagent-idc_0.2.17_amd64.deb
-dpkg-deb --info sysom_idc/sysagent-idc/release/idc-0.2.17-sysagent-20261113/sysom-agentsight-runtime_0.16.0_amd64.deb
-cd sysom_idc/sysagent-idc/release/idc-0.2.17-sysagent-20261113
-sha256sum --check SHA256SUMS
-```
-
-0.2.16 历史交付件曾分别运行原生验收（AppImage 30/30、IDE VSIX 24/24），覆盖结论与按类型分组的问题、事件证据跳转、45 进程 20/20/5 分页与名称/PID/角色/状态组合过滤、筛选重置页码且全局统计不变、空/部分/不可用/完整数据、刷新失败保留旧结果、键盘标签与多宽度布局，未发现渲染器错误、CSP 违规、私有测试字段泄漏或渲染器直连 AgentSight。当时桌面包 app.asar 内 299 个构建文件和 12 个 electron 文件与 0.2.16 构建一致，deb 与 AppImage 内 app.asar 相同，VSIX 的 332 个构建文件一致；安装入口（版本替换后与模板一致）、runtime helper 和两份 service 与源码核对通过。离线包仅含 15 项允许文件（14 项内容文件及 SHA256SUMS），所有内容哈希及归档哈希通过；0.2.16 历史离线归档 SHA256 为 `8536e6bf038ad11ac99ae460f7d3e6a2ef22d7f1909f1cecdbe93d48337f1e2e`，不属于 0.2.17。该次 0.2.16 验证未重新安装系统服务或改变真实采集授权，其他系统、TLS/协议和硬配额压力未逐一认证。旧发布文件已清理，保留历史文档和验证资料。旧 Demo 二进制工具见[开发说明](./DEVELOPMENT.md)，不替代新 UI 验收；本地打包不代表已公开发布或上传。
-
-## 0.2.6 全发行版验收记录（2026-11-09）
-
-- 根目录、桌面、VSIX 的清单与 lockfile 统一为 0.2.6。
-- 13 项模型/API/GPU 检测测试通过；包含无 GPU 评分、无效 GPU 操作拒绝、PCI 厂商识别、环境覆盖，以及 Windows 无驱动时的 PNP 硬件 ID 和 macOS 显卡输出样本。
-- 开发网页与离线 HTML 各通过有 GPU 的 11 组交互和无 GPU 的 4 组检查：隐藏导航、资源卡片、体检项、性能标签、告警选项和本机详情 GPU 字段。离线 HTML 无 HTTP 请求。
-- VSIX 模拟宿主 21 项验收通过；源码和最终 VSIX 解包后的扩展均在隔离 VS Code 1.145.2 中通过 4 项真实 IDE 冒烟测试，实际页面为 v0.2.6，确认 `SYSOM_GPU=0` 时只有四张资源卡片且无 GPU 导航。
-- AppImage 与 deb 解包运行各通过 6 组原生窗口行为和双 GPU 模式界面验收，控制台无错误，正常退出码为 0；本机无 DRM render 节点时未再出现 `Exiting GPU process due to errors during initialization`，没有绕过 Chromium 沙箱。
-- 四份交付文件 SHA256 复核通过：完整清单见 [sysom_idc/release/release-0.2.6.json](../release/release-0.2.6.json)，总校验和见 [sysom_idc/release/SHA256SUMS-0.2.6](../release/SHA256SUMS-0.2.6)。未自动安装、升级、提交或上传。
-- 原生运行在 Linux 验收；Windows/macOS 仅验证查询逻辑的模拟输出，未在对应系统上实测。硬件识别只读，所有业务操作仍为模拟，FastAPI 后端保持空置。
-
-## 0.2.5 全发行版验收记录（2026-11-07）
-
-- 根目录统一版本、桌面/VSIX 清单与 lockfile 均为 0.2.5；界面产品版本由同一版本源注入。
-- 11 项模型/API 测试与 IDE 类型检查通过。
-- VSIX 模拟宿主 21 项验收通过；源码扩展与最终 VSIX 解压后的扩展分别在隔离 VS Code 1.145.2 中通过 4 项冒烟测试，实际页面显示 v0.2.5。
-- 离线 HTML 通过 11 组页面交互及四种宽度验收，控制台无错误，HTTP 请求为零。
-- AppImage 免 FUSE 运行及 deb 解包运行各通过 6 组原生窗口和 11 组页面验收，包含拖动、五次系统最小化/Enter 恢复、模拟告警与 WM_CLASS 核对；控制台无错误，退出码为 0，未绕过 Chromium 沙箱。
-- deb、AppImage、离线 HTML、VSIX 四份交付文件 SHA256 校验通过；完整批次见 [sysom_idc/release/release-0.2.5.json](../release/release-0.2.5.json)，总校验和见 [sysom_idc/release/SHA256SUMS-0.2.5](../release/SHA256SUMS-0.2.5)。已完成版本禁止覆盖。
-- 未自动安装桌面应用或插件，未提交或上传市场。全部业务仍为模拟，未访问或修改真实设备，FastAPI 业务后端保持空置。
-
-## 0.1.1 本机验收记录（2026-11-06）
-
-- 类型检查、Vite 构建与 Electron Builder 打包通过。
-- 新目录下的前端六页面截图与 FastAPI 模拟接口测试通过。
-- AppImage 免 FUSE 运行及 deb 解包后的运行测试通过，包含六页面、日志空结果与恢复、弹窗开关及正常退出，控制台无错误。
-- deb 中的 postinst 与源码脚本一致；使用模拟命令确认设置 root 所有权和 4755 权限，没有在验收中修改实际安装目录权限。
-- apt 模拟升级从 0.1.0 到 0.1.1 通过，没有自动执行真实升级。
-- 校验和文件：[SHA256SUMS-0.1.1](../sysagent-idc/release/SHA256SUMS-0.1.1)。
-
-## 0.1.2 本机验收记录（2026-11-06）
-
-- 类型检查、Vite 构建与 Electron Builder 打包通过。
-- 新图标的网页加载及 128 像素预览检查通过；PNG 为 1024 × 1024，外角透明。
-- AppImage 免 FUSE 运行通过，包含图标资源、六页面、日志空结果与恢复、弹窗开关及正常退出，控制台无错误。
-- deb 中的 1024 像素桌面图标与源码 PNG 一致，桌面入口引用正确；postinst 与源码脚本一致，保留沙箱权限修复。
-- apt 模拟升级从 0.1.0 到 0.1.2 通过，没有自动执行真实升级。
-- 校验和文件：[SHA256SUMS-0.1.2](../sysagent-idc/release/SHA256SUMS-0.1.2)。
-
-## 0.2.0 本机验收记录（2026-11-07）
-
-- 根据原始 demo 重新生成可维护 TSX 源码，原始 HTML 与旧版前端备份保留。
-- 严格类型检查、Vite 构建、离线 HTML 构建与 Electron Builder 打包通过。
-- 11 项模型/API 测试通过，包含原始评分与清理逻辑对照、Session 范围保护、版本冲突和 HTTP 参数校验。
-- 原始 demo、开发网页和单文件离线版通过相同的 11 组完整交互验收，包含四种宽度；控制台无错误，离线版 HTTP 请求为零。
-- 固定时间并等待字体加载后，六个页面在 1440 和 390 像素宽度的可见截图与原始 demo 像素一致；记录在 `sysom_idc/sysagent-analysis/tests/output/fixed-visual-diff.json`。
-- AppImage 免 FUSE 运行与 deb 解包运行均通过完整交互、图标、preload、本地协议及正常退出验收；没有绕过 Chromium 沙箱。
-- deb 的 postinst、1024 像素透明图标与源码一致；安装脚本语法检查通过。
-- apt 模拟从已安装的 0.1.2 升级到 0.2.0 通过，没有执行实际安装或升级。
-- 三个交付文件的校验和验证通过：[SHA256SUMS-0.2.0](../sysagent-idc/release/SHA256SUMS-0.2.0)。
-- 所有业务操作仅为模拟，不访问或修改真实设备；FastAPI 业务逻辑仍为空，未接入前端。
-
-## 0.2.1 本机验收记录（2026-11-07）
-
-- 严格类型检查、Vite 构建、离线 HTML 构建及 Electron Builder 打包通过，11 项模型/API 回归测试通过。
-- AppImage 免 FUSE 运行和 deb 解包运行分别通过 6 组原生窗口与 11 组页面验收；控制台无错误，正常退出码为 0。
-- 验证主页直开、最小化/关闭收起为透明置顶小管家、真实桌面拖动、点击/Enter 恢复、拖动取消、状态与位置保留，以及主窗口隐藏时的模拟异常抖动和提示关闭。
-- 在本机 2 倍缩放屏幕上，通过 Electron 工作区坐标和 xwininfo 核对浮窗实际显示于桌面右下角，没有绕过 Chromium 沙箱或修改系统安全策略。
-- 开发网页和离线版分别通过 11 组页面交互及四种宽度验收；离线版 HTTP 请求为零。
-- 应用图标为主页同款绿色盾牌，1024 × 1024 PNG 外角透明；deb 桌面图标和 postinst 与源码一致，桌面入口及安装脚本语法检查通过。
-- apt 模拟从已安装的 0.2.0 升级到 0.2.1 通过，没有执行实际安装或升级。
-- 三个交付文件的校验和验证通过：[SHA256SUMS-0.2.1](../sysagent-idc/release/SHA256SUMS-0.2.1)。
-- 原始 demo 与历史交付文件保留；全部业务操作和告警仍为模拟，不访问或修改真实设备，FastAPI 后端逻辑未实现且未接入。
-
-## 0.2.2 本机验收记录（2026-11-07）
-
-- 系统应用与窗口图标恢复为浅蓝色 SysAgent 小管家（淡蓝圆环与绿色状态点）；矢量图与原 0.2.0 交付包一致，主页左上角盾牌不变。
-- 与 0.2.1 对照，主进程窗口代码、preload 与前端入口未变化；保留主页直开、收起、拖动、点击/Enter 恢复和模拟异常抖动。
-- 类型检查、Vite/离线 HTML/Electron 打包与 11 项模型/API 测试通过；网页和离线版各通过 11 组交互验收，离线版 HTTP 请求为零。
-- AppImage 和 deb 解包运行各通过 6 组原生窗口及 11 组页面验收，控制台无错误，退出码为 0。
-- deb 桌面图标、内嵌 SVG/PNG 与源码一致；打包运行验收增加 PNG 逐字节比对，安装脚本保持不变且语法检查通过。
-- apt 模拟从已安装的 0.2.0 升级到 0.2.2 通过，没有执行实际安装或升级；三份交付文件校验和验证通过：[SHA256SUMS-0.2.2](../sysagent-idc/release/SHA256SUMS-0.2.2)。
-- 不访问或修改真实设备，后端逻辑仍为空，历史交付包与原始 demo 保留。
-
-## 0.2.3 本机验收记录（2026-11-07）
-
-- 标题栏、主页健康中心、页脚和关于窗口改用浅蓝悬浮小管家 Logo，与系统应用、窗口及 IDE 插件沿用同一小管家形象；原始参考 demo 保持不变。
-- 系统最小化时先恢复窗口的最小化状态再隐藏，避免 Linux 窗口管理器在恢复主页时重放残留的最小化事件。
-- 类型检查、Vite/离线 HTML/Electron 打包与 11 项模型/API 测试通过；离线版通过 11 组交互及四种宽度验收，HTTP 请求为零。
-- AppImage 两次完整运行与 deb 解包运行均通过 6 组原生窗口及 11 组页面验收；每次连续五次系统最小化/Enter 恢复，控制台无错误，退出码为 0。
-- deb 安装脚本语法检查和从已安装 0.2.2 到 0.2.3 的 apt 模拟升级通过，没有执行实际升级或修改系统权限。
-- 交付文件校验和见 [sysom_idc/sysagent-idc/release/SHA256SUMS-0.2.3](../sysagent-idc/release/SHA256SUMS-0.2.3)。
-- 共用页面的插件 0.1.1 通过 21 项模拟宿主和 4 项真实 VS Code 验收，VSIX 在隔离目录安装成功；校验和见 [sysom_idc/sysagent-ide-extension/release/SHA256SUMS-0.1.1](../sysagent-ide-extension/release/SHA256SUMS-0.1.1)。
-- 所有业务操作仍为模拟，不访问或修改真实设备，FastAPI 后端逻辑仍为空且未接入。
-
-## 0.2.4 本机验收记录（2026-11-07）
-
-- 问题：0.2.3 桌面入口声明 `StartupWMClass=SysOM管家`，而当时运行窗口的 WM_CLASS 为 `sysom-guard`，Ubuntu Dock 无法匹配入口，显示通用齿轮图标。
-- 历史修复：`linux.desktop.StartupWMClass` 设为当时的 `sysom-guard`；`npm run icon` 额外生成 `sysom_idc/sysagent-idc/build/icons/` 下 16–1024 像素图标，deb 安装到 hicolor 全部尺寸，postinst 刷新图标缓存。
-- 当时 deb 与 AppImage 内的桌面入口均为 `StartupWMClass=sysom-guard`，各含 9 个尺寸的小管家图标。
-- AppImage 免 FUSE 运行与 deb 解包运行均通过 6 组原生窗口及 11 组页面验收，新增主窗口与桌面小管家的 WM_CLASS 核对；控制台无错误，退出码为 0。
-- 11 项模型/API 测试和离线版 11 组交互验收通过，离线版 HTTP 请求为零；安装脚本语法检查和从已安装 0.2.3 到 0.2.4 的 apt 模拟升级通过，没有执行实际升级。
-- 交付文件校验和见 [sysom_idc/sysagent-idc/release/SHA256SUMS-0.2.4](../sysagent-idc/release/SHA256SUMS-0.2.4)。
-- 所有业务操作仍为模拟，不访问或修改真实设备，FastAPI 后端逻辑仍为空且未接入。
+原创代码采用 MIT；交付时保留 `LICENSE`、`THIRD_PARTY_NOTICES`、`FONT_LICENSE`。VSIX 内含 `LICENSE.txt`、第三方声明与字体许可。AgentSight、sysAK、GX、字体和依赖保持各自许可，SysAgent 的 MIT 不对第三方重新授权。完整性校验、构建成功或硬件识别不等于许可审查或硬件功能认证。

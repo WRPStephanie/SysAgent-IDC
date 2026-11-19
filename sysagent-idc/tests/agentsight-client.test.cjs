@@ -6,6 +6,15 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 const ts = require('typescript');
+// Controllers without an explicit hook directory must never inspect real user state.
+const previousStateHome = process.env.XDG_STATE_HOME;
+const scratchStateHome = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'sysagent-agentsight-test-state-'));
+process.env.XDG_STATE_HOME = scratchStateHome;
+require('node:test').after(() => {
+  if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = previousStateHome;
+  fs.rmSync(scratchStateHome, { recursive: true, force: true });
+});
 const { collectAgentEvidence, agentSightUrl } = require('../electron/agentsight-client.cjs');
 const { createIdcController } = require('../electron/idc-controller.cjs');
 
@@ -26,6 +35,45 @@ async function fixture(t, handler) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
+// Retained-history tests below use Response/ReadableStream only: no sockets, databases or credentials.
+const STORED_TEST_NOW = 1794369600123;
+const STORED_TEST_FAMILIES = [
+  ['agentsight_token_input_total', 'inputTokens', 'Total input tokens consumed by agent (all-time)'],
+  ['agentsight_token_output_total', 'outputTokens', 'Total output tokens consumed by agent (all-time)'],
+  ['agentsight_llm_requests_total', 'calls', 'Total LLM requests made by agent (all-time)'],
+];
+function storedMetricText(rows = []) {
+  const label = agent => agent.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  return STORED_TEST_FAMILIES.map(([name, key, help]) => `# HELP ${name} ${help}\n# TYPE ${name} counter\n` +
+    rows.map(row => `${name}{agent="${label(row.agent)}"} ${row[key]}\n`).join('')).join('\n');
+}
+function storedFixture({ now = STORED_TEST_NOW, metrics = storedMetricText([{ agent: 'unknown', calls: 6001, inputTokens: 7002, outputTokens: 8003 }]),
+  sessions, counts = { total: 901, by_severity: { critical: 301, high: 600, medium: 0, low: 0 } }, overrides = {}, current } = {}) {
+  const data = current || dataFor(now);
+  const history = { usage: metrics, sessions: sessions === undefined ? data['/api/sessions'] : sessions, interruptionCounts: counts };
+  const seen = [];
+  return { seen, data, history, fetchImpl: async (input, init) => {
+    const url = new URL(input);
+    assert.equal(url.origin, 'http://127.0.0.1:7396');
+    assert.equal(init.method, 'GET');
+    assert.equal(init.redirect, 'error');
+    assert.equal(init.cache, 'no-store');
+    assert.equal(init.headers.authorization, 'Bearer fixture-token');
+    assert(init.signal instanceof AbortSignal);
+    const key = url.pathname === '/metrics' ? 'usage' : url.searchParams.get('start_ns') === '-9223372036854775808' ?
+      url.pathname === '/api/sessions' ? 'sessions' : 'interruptionCounts' : null;
+    seen.push({ url, init, key });
+    if (key && Object.hasOwn(overrides, key)) return overrides[key](url, init);
+    const value = key ? history[key] : data[url.pathname];
+    assert.notEqual(value, undefined, `Unexpected endpoint ${url.pathname}`);
+    return new Response(key === 'usage' ? value : JSON.stringify(value), {
+      headers: { 'content-type': key === 'usage' ? 'text/plain; version=0.0.4; charset=utf-8' : 'application/json' },
+    });
+  } };
+}
+const collectStored = (fixture, options = {}) => collectAgentEvidence({ baseUrl: 'http://127.0.0.1:7396',
+  token: 'fixture-token', now: STORED_TEST_NOW, fetchImpl: fixture.fetchImpl, ...options });
+
 function dataFor(now = Date.now()) {
   const ns = Number(BigInt(now) * 1000000n);
   return {
@@ -41,6 +89,7 @@ function dataFor(now = Date.now()) {
     '/api/interruptions': [{ interruption_id: 'fixture-interruption', session_id: null, call_id: null, pid: null, agent_name: null,
       interruption_type: 'llm_error', severity: 'high', occurred_at_ns: ns, resolved: false, detail: 'fixture-private-detail' }],
     '/api/interruptions/count': { total: 1, by_severity: { critical: 0, high: 1, medium: 0, low: 0 } },
+    '/metrics': storedMetricText([{ agent: 'Fixture Agent', calls: 3, inputTokens: 0, outputTokens: 45 }]),
     '/api/metrics/latency': [
       { agent_name: null, call_count: 2, streaming_call_count: 1, ttft_ms: null,
         tps_tokens_per_second: { p50: 0, p95: 0, p99: 0, detail: 'fixture-private-quantile' },
@@ -53,7 +102,10 @@ function dataFor(now = Date.now()) {
   };
 }
 
-const send = (response, data) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(data)); };
+const send = (response, data) => {
+  response.writeHead(200, { 'content-type': typeof data === 'string' ? 'text/plain; version=0.0.4' : 'application/json' });
+  response.end(typeof data === 'string' ? data : JSON.stringify(data));
+};
 
 // Interpret real TS modules in memory without bundling, emission or external actions.
 const projectRoot = path.resolve(__dirname, '..');
@@ -113,9 +165,10 @@ test('collects only allowlisted GET endpoints with exact ns window and strips se
     send(response, data[url.pathname]);
   });
   const raw = await collectAgentEvidence({ baseUrl, token: 'fixture-token', now });
-  assert.equal(seen.length, 5);
+  assert.equal(seen.length, 8);
   assert(seen.every(item => item.method === 'GET' && item.auth === 'Bearer fixture-token'));
-  for (const item of seen.filter(item => item.url.pathname !== '/api/agent-process-health')) {
+  for (const item of seen.filter(item => item.url.pathname !== '/api/agent-process-health' && item.url.pathname !== '/metrics' &&
+      item.url.searchParams.get('start_ns') !== '-9223372036854775808')) {
     assert.equal(item.url.searchParams.get('end_ns'), String(BigInt(now) * 1000000n));
     assert.equal(item.url.searchParams.get('start_ns'), String(BigInt(now - 86400000) * 1000000n));
   }
@@ -174,8 +227,8 @@ test('real HTTP includes main and auxiliary sessions in the latency window witho
     } else send(response, url.pathname === '/api/metrics/latency' ? latency : data[url.pathname]);
   });
   const raw = await collectAgentEvidence({ baseUrl, token: 'fixture-token', now });
-  assert.equal(seen.length, 5);
-  assert.deepEqual(seen.map(url => url.pathname).sort(), Object.keys(data).sort());
+  assert.equal(seen.length, 8);
+  assert.deepEqual(seen.map(url => url.pathname).sort(), [...Object.keys(data), '/api/sessions', '/api/interruptions/count'].sort());
   const sessionUrl = seen.find(url => url.pathname === '/api/sessions');
   const latencyUrl = seen.find(url => url.pathname === '/api/metrics/latency');
   assert.equal(sessionUrl.searchParams.get('include_auxiliary'), 'true');
@@ -291,11 +344,19 @@ test('controller routes AgentSight through real OpenAPI without requiring SysAK 
     requests++;
     send(response, data[new URL(request.url, 'http://localhost').pathname]);
   });
-  const controller = await createIdcController({ bundleRoot: MISSING_SYSAK_ROOT, sysakBinary: MISSING_SYSAK_BINARY, sysomConfig: null, startMockOpenApi: loadOpenApi(), agentSight: { baseUrl } });
+  const temporary = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'sysagent-hook-controller-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const directory = path.join(temporary, 'sysagent', 'agent-hooks');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const filename = path.join(directory, 'events.jsonl');
+  const event = { v: 1, event_id: '0000000000000001', agent: 'qoder', kind: 'prompt_submit', occurred_at: new Date().toISOString(),
+    session_id: 'hook-session', tool: null, call_id: null, error_type: null, interrupt: null, subagent: null, model: null };
+  fs.writeFileSync(filename, JSON.stringify(event) + '\n', { mode: 0o600 });
+  const controller = await createIdcController({ bundleRoot: MISSING_SYSAK_ROOT, sysakBinary: MISSING_SYSAK_BINARY, sysomConfig: null, startMockOpenApi: loadOpenApi(), agentSight: { baseUrl }, agentHooks: { directory } });
   t.after(() => controller.close());
   assert.equal(controller.status().installed, false);
   const [first, second] = await Promise.all([controller.agentSnapshot(), controller.agentSnapshot(true)]);
-  assert.equal(requests, 5);
+  assert.equal(requests, 8);
   assert.equal(first.source, 'agentsight');
   assert.equal(first.analyzer, 'sysom-openapi');
   assert.equal(first.totals.unresolved, 1);
@@ -310,12 +371,19 @@ test('controller routes AgentSight through real OpenAPI without requiring SysAK 
   assert.equal(first.processes[0].latencyMs, 0);
   assert.equal(first.interruptions[0].sessionId, null);
   assert.deepEqual(second, first);
+  assert.equal(first.hooks.status, 'available');
+  assert.equal(first.hooks.agents[0].prompts, 1);
+  assert.equal(first.hooks.events[0].sessionId, 'hook-session');
+  fs.appendFileSync(filename, JSON.stringify({ ...event, event_id: '0000000000000002' }) + '\n');
+  first.hooks.events.length = 0;
   first.sessions.length = 0;
   const cached = await controller.agentSnapshot();
+  assert.equal(cached.hooks.events.length, 1, 'Cached GET must not reread the spool');
   assert.equal(cached.sessions.length, 1);
-  assert.equal(requests, 5);
-  await controller.agentSnapshot(true);
-  assert.equal(requests, 10);
+  assert.equal(requests, 8);
+  const refreshed = await controller.agentSnapshot(true);
+  assert.equal(refreshed.hooks.events.length, 2);
+  assert.equal(requests, 16);
   const view = controller.queryView();
   assert.equal(view.state, null);
   assert.equal(view.agent.sessions.length, 1);
@@ -326,14 +394,139 @@ test('controller routes AgentSight through real OpenAPI without requiring SysAK 
   view.tasks.length = 0;
   assert.equal(controller.queryView().agent.sessions.length, 1);
   assert.equal(controller.queryView().tasks.length, 2);
-  assert.equal(requests, 10);
+  assert.equal(requests, 16);
   await assert.rejects(controller.snapshot(), /sysAK/);
   await assert.rejects(controller.agentSnapshot('true'), { code: 'INVALID_PARAMETERS' });
   controller.setEnabled(false);
   await assert.rejects(controller.agentSnapshot(), { code: 'COLLECTOR_DISABLED' });
 });
 
-test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicates five-endpoint recollection', async t => {
+test('app and IDE controllers share cumulative Hook history; cached GETs and queryView never write the ledger', async t => {
+  const scheduler = fakeAgentScheduler(Date.now());
+  let requests = 0;
+  const baseUrl = await fixture(t, (request, response) => {
+    requests++;
+    send(response, dataFor(scheduler.now())[new URL(request.url, 'http://localhost').pathname]);
+  });
+  const temporary = fs.mkdtempSync(path.join(scratchStateHome, 'shared-hosts-'));
+  const directory = path.join(temporary, 'sysagent', 'agent-hooks');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const current = path.join(directory, 'events.jsonl');
+  const rotated = path.join(directory, 'events.1.jsonl');
+  const db = path.join(directory, 'history.sqlite3');
+  const recentAt = new Date(scheduler.now()).toISOString();
+  const oldAt = new Date(scheduler.now() - 7 * 86400000).toISOString();
+  const event = { v: 1, event_id: '0000000000000001', agent: 'qoder', kind: 'prompt_submit', occurred_at: recentAt,
+    session_id: 'shared-session', tool: null, call_id: null, error_type: null, interrupt: null, subagent: null, model: null };
+  const oldRows = Array.from({ length: 20 }, (_, index) => ({ ...event, event_id: (100 + index).toString(16).padStart(16, '0'),
+    agent: `agent-${index}`, session_id: `older-${index}`, occurred_at: oldAt }));
+  fs.writeFileSync(rotated, oldRows.map(row => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
+  fs.writeFileSync(current, JSON.stringify(event) + '\n', { mode: 0o600 });
+  const options = { bundleRoot: MISSING_SYSAK_ROOT, sysakBinary: MISSING_SYSAK_BINARY, sysomConfig: null,
+    startMockOpenApi: loadOpenApi(), scheduler, agentSight: { baseUrl }, agentHooks: { directory },
+    processActionImpl: () => assert.fail('Hook migration must not perform a process action') };
+  const app = await createIdcController(options);
+  t.after(() => app.close());
+  const ide = await createIdcController(options);
+  t.after(() => ide.close());
+  assert.equal(app.queryView().agent, null);
+  assert.equal(ide.queryView().agent, null);
+  assert(!fs.existsSync(db), 'Controller creation and queryView must not initialize history');
+  const files = () => Object.fromEntries(fs.readdirSync(directory).sort().map(name => {
+    const file = path.join(directory, name);
+    const info = fs.lstatSync(file);
+    return [name, { hash: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+      ...Object.fromEntries(['dev', 'ino', 'mode', 'uid', 'nlink', 'size', 'mtimeMs', 'ctimeMs'].map(key => [key, info[key]])) }];
+  }));
+  const legacy = files();
+  const [appFirst, ideFirst] = await Promise.all([app.agentSnapshot(true), ide.agentSnapshot(true)]);
+  assert.equal(requests, 16);
+  const counts = events => ({ sessions: events === 21 ? 21 : 22, events, prompts: events, toolStarts: 0, toolEnds: 0,
+    toolFailures: 0, interrupts: 0, permissionDenied: 0, turnFailures: 0, openTools: 0 });
+  for (const report of [appFirst, ideFirst]) {
+    assert.equal(report.hooks.history.status, 'available');
+    assert.deepEqual(report.hooks.history.totals, counts(21));
+    assert.deepEqual(report.hooks.history.range, { start: oldAt, end: recentAt });
+    assert.equal(report.hooks.events.length, 1, 'Old events contribute only to cumulative history');
+    assert.equal(report.hooks.agents[0].events, 1);
+  }
+  for (const name of ['events.1.jsonl', 'events.jsonl']) assert.deepEqual(files()[name], legacy[name]);
+  assert.deepEqual(Object.keys(files()), ['.lock', 'events.1.jsonl', 'events.jsonl', 'history.sqlite3']);
+  const append = id => fs.appendFileSync(current, JSON.stringify({ ...event, event_id: id.toString(16).padStart(16, '0'), session_id: `session-${id}` }) + '\n');
+  append(2);
+  const pendingLegacy = files();
+  for (let index = 0; index < 3; index++) {
+    assert.deepEqual(await app.agentSnapshot(false), appFirst);
+    assert.deepEqual(await ide.agentSnapshot(false), ideFirst);
+    assert.deepEqual(app.queryView().agent.hooks.history.totals, counts(21));
+    assert.deepEqual(ide.queryView().agent.hooks.history.totals, counts(21));
+    assert.deepEqual(files(), pendingLegacy, 'Cached reads and views must not import appended legacy rows');
+  }
+  assert.equal(requests, 16);
+  const refreshedApp = await app.agentSnapshot(true);
+  assert.equal(refreshedApp.hooks.events.length, 2);
+  assert.deepEqual(refreshedApp.hooks.history.totals, counts(22));
+  assert.equal(requests, 24);
+  const afterApp = files();
+  assert.deepEqual((await ide.agentSnapshot(false)).hooks.history.totals, counts(21), 'IDE cache must remain its original snapshot');
+  assert.deepEqual(files(), afterApp);
+  scheduler.time += 60000;
+  const refreshedIde = await ide.agentSnapshot(false);
+  assert.equal(refreshedIde.hooks.events.length, 2);
+  assert.deepEqual(refreshedIde.hooks.history.totals, counts(22), 'IDE TTL refresh sees the app-imported ledger without double counting');
+  assert.equal(requests, 32);
+  fs.unlinkSync(current);
+  fs.unlinkSync(rotated);
+  const deletedDetails = files();
+  assert.deepEqual(ide.queryView().agent.hooks.history.totals, counts(22));
+  assert.deepEqual((await ide.agentSnapshot(false)).hooks.history.totals, counts(22));
+  assert.deepEqual(files(), deletedDetails);
+  const dbOnly = await app.agentSnapshot(true);
+  assert.equal(dbOnly.hooks.status, 'unavailable');
+  assert.equal(dbOnly.hooks.history.status, 'available');
+  assert.deepEqual(dbOnly.hooks.history.totals, counts(22));
+  assert.deepEqual(files(), deletedDetails, 'DB-only refresh must not append, rotate, clear or recreate details');
+});
+
+test('controller refresh replaces trusted read-only history with an explicit prepare failure, without repairing unsafe details', async t => {
+  const scheduler = fakeAgentScheduler(Date.now());
+  const baseUrl = await fixture(t, (request, response) => send(response, dataFor(scheduler.now())[new URL(request.url, 'http://localhost').pathname]));
+  const temporary = fs.mkdtempSync(path.join(scratchStateHome, 'unsafe-refresh-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const directory = path.join(temporary, 'sysagent', 'agent-hooks');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const current = path.join(directory, 'events.jsonl');
+  const db = path.join(directory, 'history.sqlite3');
+  const event = { v: 1, event_id: '0000000000000001', agent: 'qoder', kind: 'prompt_submit', occurred_at: new Date(scheduler.now()).toISOString(),
+    session_id: 'unsafe-refresh-session', tool: null, call_id: null, error_type: null, interrupt: null, subagent: null, model: null };
+  fs.writeFileSync(current, JSON.stringify(event) + '\n', { mode: 0o600 });
+  const controller = await createIdcController({ bundleRoot: MISSING_SYSAK_ROOT, sysakBinary: MISSING_SYSAK_BINARY, sysomConfig: null,
+    startMockOpenApi: loadOpenApi(), scheduler, agentSight: { baseUrl }, agentHooks: { directory } });
+  t.after(() => controller.close());
+  const first = await controller.agentSnapshot(true);
+  assert.equal(first.hooks.history.status, 'available');
+  fs.chmodSync(current, 0o644);
+  const hash = () => crypto.createHash('sha256').update(fs.readFileSync(db)).digest('hex');
+  const before = hash();
+  const readOnly = require('../electron/agent-hooks.cjs').collectHookEvidence({ directory, window: first.window });
+  assert.equal(readOnly.status, 'invalid');
+  assert.equal(readOnly.history.status, 'available', 'The independent read-only ledger is still trusted');
+  assert.deepEqual(await controller.agentSnapshot(false), first, 'Cache hits must not attempt migration or revalidate details');
+  const refreshed = await controller.agentSnapshot(true);
+  assert.equal(refreshed.hooks.status, 'invalid');
+  assert.equal(refreshed.hooks.history.status, 'invalid', 'Prepare refusal must override otherwise available read-only history');
+  assert.deepEqual(refreshed.hooks.history.range, { start: null, end: null });
+  assert(Object.values(refreshed.hooks.history.totals).every(value => value === null));
+  assert.equal(fs.statSync(current).mode & 0o777, 0o644);
+  assert.equal(hash(), before);
+  fs.chmodSync(current, 0o600); // Repair only this owned fixture, never production/user state.
+  const recovered = await controller.agentSnapshot(true);
+  assert.equal(recovered.hooks.history.status, 'available');
+  assert.equal(recovered.hooks.history.totals.events, 1);
+});
+
+test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicates eight-endpoint recollection', async t => {
   const scheduler = fakeAgentScheduler(1794369600123);
   let requests = 0;
   let roundData;
@@ -342,7 +535,7 @@ test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicat
   const held = [];
   const paths = [];
   const baseUrl = await fixture(t, (request, response) => {
-    if (requests % 5 === 0) roundData = dataFor(scheduler.now());
+    if (requests % 8 === 0) roundData = dataFor(scheduler.now());
     requests++;
     const route = new URL(request.url, 'http://localhost').pathname;
     paths.push(route);
@@ -350,10 +543,10 @@ test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicat
     const value = roundData[route];
     if (hold) {
       held.push(() => send(response, value));
-      if (held.length === 5) reached();
+      if (held.length === 8) reached();
     } else {
       // The first successful collection finishes later than its query-window start.
-      if (requests === 5) scheduler.time += 2500;
+      if (requests === 8) scheduler.time += 2500;
       send(response, value);
     }
   });
@@ -364,18 +557,18 @@ test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicat
   const first = await controller.agentSnapshot(false);
   const cachedAt = scheduler.now();
   assert.equal(first.window.end, new Date(cachedAt - 2500).toISOString());
-  assert.equal(requests, 5);
+  assert.equal(requests, 8);
   assert.deepEqual(await controller.agentSnapshot(false), first); // age = 0
   scheduler.time = cachedAt + 59999;
   assert.deepEqual(await controller.agentSnapshot(false), first);
-  assert.equal(requests, 5, 'TTL must start at successful completion, not at collection start');
+  assert.equal(requests, 8, 'TTL must start at successful completion, not at collection start');
 
   scheduler.time = cachedAt + 60000;
   hold = true;
   const allRequested = new Promise(resolve => { reached = resolve; });
   const pending = Array.from({ length: 8 }, () => controller.agentSnapshot(false));
   await allRequested;
-  assert.equal(requests, 10, 'Concurrent expired reads must issue only one round of five GETs');
+  assert.equal(requests, 16, 'Concurrent expired reads must issue only one round of eight GETs');
   assert.equal(controller.queryView().tasks.length, 1, 'No report is committed while collection is held');
   hold = false;
   held.splice(0).forEach(release => release());
@@ -386,20 +579,20 @@ test('fake scheduler reuses through 59999 ms, expires at 60000 ms and deduplicat
   for (const report of reports) assert.deepEqual(report, second);
   assert.notEqual(reports[0], reports[1], 'Each caller receives an independent clone');
   assert.equal(controller.queryView().tasks.length, 2);
-  for (let index = 0; index < paths.length; index += 5) {
-    assert.deepEqual(paths.slice(index, index + 5).sort(), Object.keys(roundData).sort());
+  for (let index = 0; index < paths.length; index += 8) {
+    assert.deepEqual(paths.slice(index, index + 8).sort(), [...Object.keys(roundData), '/api/sessions', '/api/interruptions/count'].sort());
   }
 
   const renewedAt = scheduler.now();
   scheduler.time = renewedAt + 59999;
   assert.deepEqual(await controller.agentSnapshot(false), second);
-  assert.equal(requests, 10, 'Successful recollection resets the cache timestamp');
+  assert.equal(requests, 16, 'Successful recollection resets the cache timestamp');
   scheduler.time = renewedAt + 60000;
   const third = await controller.agentSnapshot(false);
-  assert.equal(requests, 15);
+  assert.equal(requests, 24);
   assert.notEqual(third.window.end, second.window.end);
   await controller.agentSnapshot(true);
-  assert.equal(requests, 20, 'Manual refresh recollects even at cache age zero');
+  assert.equal(requests, 32, 'Manual refresh recollects even at cache age zero');
   assert.equal(controller.queryView().tasks.length, 4);
 });
 
@@ -416,13 +609,13 @@ test('fake scheduler clock rollback forces recollection and never treats a negat
   const first = await controller.agentSnapshot(false);
   scheduler.time--;
   const rolledBack = await controller.agentSnapshot(false);
-  assert.equal(requests, 10);
+  assert.equal(requests, 16);
   assert.notEqual(rolledBack.window.end, first.window.end);
   assert.equal(rolledBack.window.end, new Date(scheduler.now()).toISOString());
   assert.deepEqual(await controller.agentSnapshot(false), rolledBack);
-  assert.equal(requests, 10, 'Successful rollback recollection establishes a new age-zero cache');
+  assert.equal(requests, 16, 'Successful rollback recollection establishes a new age-zero cache');
   await controller.agentSnapshot(true);
-  assert.equal(requests, 15);
+  assert.equal(requests, 24);
   assert.equal(controller.queryView().tasks.length, 3);
 });
 
@@ -490,14 +683,14 @@ test('controller failure preserves prior analysis without extending TTL; expired
   assert.equal(observedBody.raw_snapshot.source, 'agentsight');
   assert.equal(observedBody.raw_snapshot.collector, undefined);
   assert(!JSON.stringify(observedBody).includes('fixture-private-query'));
-  assert.equal(requests, 5);
+  assert.equal(requests, 8);
   assert.equal(submissions, 1);
   const cachedAt = scheduler.now();
   scheduler.time = cachedAt + 59999;
   unavailable = true;
   await assert.rejects(controller.agentSnapshot(true), { code: 'fixture_failed' });
   assert.deepEqual(await controller.agentSnapshot(false), first);
-  assert.equal(requests, 10, 'A failed fresh manual refresh still permits the original unexpired cache');
+  assert.equal(requests, 16, 'A failed fresh manual refresh still permits the original unexpired cache');
   assert.equal(submissions, 2);
 
   for (const age of [60000, 60001]) {
@@ -506,27 +699,264 @@ test('controller failure preserves prior analysis without extending TTL; expired
     assert.deepEqual(controller.queryView().agent, first, 'Failed recollection preserves original cached evidence');
     assert.equal(controller.queryView().tasks.length, 1, 'Failures must not append successful tasks');
   }
-  assert.equal(requests, 20, 'Neither failure may extend cache age or suppress the next expired retry');
+  assert.equal(requests, 32, 'Neither failure may extend cache age or suppress the next expired retry');
   assert.equal(submissions, 4);
   await assert.rejects(controller.agentSnapshot(true), { code: 'fixture_failed' });
-  assert.equal(requests, 25, 'Manual refresh always retries, even after repeated failures');
+  assert.equal(requests, 40, 'Manual refresh always retries, even after repeated failures');
   assert.equal(submissions, 5);
   assert.deepEqual(controller.queryView().agent, first);
 
   unavailable = false;
   const recovered = await controller.agentSnapshot(false);
-  assert.equal(requests, 30);
+  assert.equal(requests, 48);
   assert.equal(submissions, 6);
   assert.notEqual(recovered.window.end, first.window.end);
   assert.equal(controller.queryView().tasks.length, 2);
   const recoveredAt = scheduler.now();
   scheduler.time = recoveredAt + 59999;
   assert.deepEqual(await controller.agentSnapshot(false), recovered);
-  assert.equal(requests, 30, 'Only successful recovery renews the TTL');
+  assert.equal(requests, 48, 'Only successful recovery renews the TTL');
   scheduler.time = recoveredAt + 60000;
   await controller.agentSnapshot(false);
-  assert.equal(requests, 35);
+  assert.equal(requests, 56);
   assert.equal(submissions, 7);
+});
+
+test('stored history isolated: all-time usage and >500 sessions remain independent of bounded 24h details', async () => {
+  const current = dataFor(STORED_TEST_NOW);
+  current['/api/interruptions'] = [];
+  current['/api/interruptions/count'] = { total: 0, by_severity: { critical: 0, high: 0, medium: 0, low: 0 } };
+  const row = current['/api/sessions'][0];
+  current['/api/sessions'] = Array.from({ length: 501 }, (_, i) => ({ ...row, session_id: `window-${i}` }));
+  const oldNs = Number(BigInt(STORED_TEST_NOW - 10 * 86400000) * 1000000n);
+  const sessions = Array.from({ length: 1201 }, (_, i) => ({ ...row, session_id: `stored-${i}`, first_seen_ns: oldNs, last_seen_ns: oldNs }));
+  sessions[0].session_id = 'Case/Exact'; sessions[1].session_id = 'case/exact';
+  const metrics = storedMetricText([
+    { agent: 'main\\agent"\nline', calls: 6001, inputTokens: 7002, outputTokens: 8003 },
+    { agent: 'auxiliary', calls: 2, inputTokens: 12, outputTokens: 34 },
+    { agent: 'unknown', calls: 3, inputTokens: 45, outputTokens: 67 },
+  ]) + 'agentsight_cache_read_input_total{agent="unknown"} 999999\n' +
+    'agentsight_token_total_total{agent="unknown"} 999999\n';
+  const fixture = storedFixture({ current, sessions, metrics });
+  const raw = await collectStored(fixture);
+  assert.equal(fixture.seen.length, 8);
+  assert.deepEqual(fixture.seen.filter(item => item.key).map(item => item.url.pathname), ['/metrics', '/api/sessions', '/api/interruptions/count']);
+  for (const item of fixture.seen.filter(item => item.key && item.key !== 'usage')) {
+    assert.equal(item.url.searchParams.get('start_ns'), '-9223372036854775808');
+    assert.equal(item.url.searchParams.get('end_ns'), '9223372036854775807');
+    assert.equal(item.url.searchParams.get('limit'), null);
+    assert.equal(item.url.searchParams.get('resolved'), null);
+  }
+  assert.equal(fixture.seen.find(item => item.key === 'sessions').url.searchParams.get('include_auxiliary'), 'true');
+  assert.equal(fixture.seen.find(item => item.key === 'usage').init.headers.accept, 'text/plain');
+  const baselineRaw = structuredClone(raw); delete baselineRaw.history;
+  const baseline = parseEvidence(baselineRaw);
+  const report = parseEvidence(raw);
+  assert.deepEqual(raw.history.sources.usage.data, { inputTokens: 7059, outputTokens: 8104, calls: 6006 });
+  assert.deepEqual(raw.history.sources.sessions.data, { total: 1201 });
+  assert.equal(report.history.status, 'ok');
+  assert.deepEqual(report.history.totals, { sessions: 1201, calls: 6006, inputTokens: 7059, outputTokens: 8104, unresolved: 901, critical: 301, high: 600 });
+  assert.equal(report.history.sampledAt, raw.sampled_at);
+  assert.equal(report.sessions.length, 500);
+  assert.equal(report.status, 'partial'); assert.equal(report.outcome, 'unknown');
+  assert.deepEqual(report.totals, baseline.totals);
+  assert.equal(report.totals.unresolved, 0);
+  assert.equal(report.totals.sessions, null);
+  const withoutHistory = structuredClone(report); delete withoutHistory.history;
+  assert.deepEqual(withoutHistory, baseline, 'Historical critical events must not inflate current health, findings or coverage');
+  assert.doesNotMatch(JSON.stringify(raw), /stored-\d|Case\/Exact|main\\\\agent|cache_read|token_total_total|fixture-private-query/);
+});
+
+test('stored history isolated: authoritative empty metrics prove zero, absent or incompatible metrics stay unknown', async () => {
+  const empty = await collectStored(storedFixture({ metrics: storedMetricText(), sessions: [], counts: { total: 0, by_severity: { critical: 0, high: 0, medium: 0, low: 0 } } }));
+  assert.deepEqual(empty.history.sources.usage.data, { inputTokens: 0, outputTokens: 0, calls: 0 });
+  assert.deepEqual(parseEvidence(empty).history.totals, { sessions: 0, calls: 0, inputTokens: 0, outputTokens: 0, unresolved: 0, critical: 0, high: 0 });
+  const valid = storedMetricText([{ agent: 'a', calls: 1, inputTokens: 2, outputTokens: 3 }]);
+  const invalidBodies = [
+    '', '# unrelated metrics\n', '<html>unsupported</html>',
+    valid.replace('counter', 'gauge'), valid.replace(' (all-time)', ''),
+    valid.replace('# TYPE agentsight_token_input_total counter\n', ''),
+    valid + '# ERROR querying metrics\n', valid + '# TYPE agentsight_llm_requests_total counter\n',
+    valid + 'agentsight_llm_requests_total{agent="a"} 1\n',
+    valid.replace('agent="a"', 'agent="a",model="m"'),
+    valid.replace('agent="a"', 'agent="bad\\t"'),
+    valid.replace('agent="a"', 'agent="bad'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} -2'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} 2e0'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} 2.0'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} NaN'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} 9007199254740992'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} 9007199254740993'),
+    valid.replace('agentsight_token_input_total{agent="a"} 2', 'agentsight_token_input_total{agent="a"} 2 123'),
+    valid.replace('agentsight_llm_requests_total{agent="a"} 1', 'agentsight_llm_requests_total{agent="b"} 1'),
+    storedMetricText([{ agent: 'a', calls: 1, inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 0 }, { agent: 'b', calls: 1, inputTokens: 1, outputTokens: 0 }]),
+  ];
+  for (const metrics of invalidBodies) {
+    const raw = await collectStored(storedFixture({ metrics }));
+    assert.equal(raw.history.sources.usage.status, 'invalid', metrics);
+    assert.equal(raw.history.sources.usage.data, null);
+    assert.equal(raw.history.sources.sessions.status, 'available');
+    const report = parseEvidence(raw);
+    assert.equal(report.history.status, 'partial');
+    assert.deepEqual([report.history.totals.calls, report.history.totals.inputTokens, report.history.totals.outputTokens], [null, null, null]);
+    assert.equal(report.history.totals.sessions, 1);
+    assert.equal(report.history.totals.unresolved, 901);
+  }
+  const boundary = await collectStored(storedFixture({ metrics: storedMetricText([{ agent: '', calls: Number.MAX_SAFE_INTEGER, inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 0 }]) }));
+  assert.equal(boundary.history.sources.usage.data.inputTokens, Number.MAX_SAFE_INTEGER);
+  const escaped = storedMetricText([{ agent: 'a\nb\\"', calls: 1, inputTokens: 2, outputTokens: 3 }]);
+  const duplicateSample = escaped.split('\n').find(line => line.startsWith('agentsight_llm_requests_total{'));
+  const duplicate = await collectStored(storedFixture({ metrics: escaped + duplicateSample + '\n' }));
+  assert.equal(duplicate.history.sources.usage.data, null);
+  const distinctEscapes = await collectStored(storedFixture({ metrics: storedMetricText([
+    { agent: '\n', calls: 1, inputTokens: 2, outputTokens: 3 },
+    { agent: '\\n', calls: 4, inputTokens: 5, outputTokens: 6 },
+  ]) }));
+  assert.deepEqual(distinctEscapes.history.sources.usage.data, { inputTokens: 7, outputTokens: 9, calls: 5 });
+  for (const [, key] of STORED_TEST_FAMILIES) {
+    const rows = [{ agent: 'a', calls: 0, inputTokens: 0, outputTokens: 0 }, { agent: 'b', calls: 0, inputTokens: 0, outputTokens: 0 }];
+    rows[0][key] = Number.MAX_SAFE_INTEGER; rows[1][key] = 1;
+    const raw = await collectStored(storedFixture({ metrics: storedMetricText(rows) }));
+    assert.equal(raw.history.sources.usage.data, null, `Unsafe ${key} sum`);
+  }
+});
+
+test('stored history isolated: full session rows and severity sums validate before minimization', async () => {
+  const row = dataFor(STORED_TEST_NOW)['/api/sessions'][0];
+  const cases = [
+    {}, null, [row, row], [{ ...row, session_id: '' }], [{ ...row, session_id: 123 }],
+    [{ ...row, first_seen_ns: NaN }], [{ ...row, first_seen_ns: Infinity }],
+    [{ ...row, first_seen_ns: 1.5 }], [{ ...row, first_seen_ns: 1e22 }],
+    [{ ...row, last_seen_ns: row.first_seen_ns - 1000000 }],
+    [{ ...row, total_input_tokens: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ ...row, total_output_tokens: -1 }], [{ ...row, conversation_count: 1.2 }],
+    [{ ...row, agent_name: {} }], [{ ...row, model: '' }],
+    [Object.fromEntries(Object.entries(row).filter(([key]) => key !== 'model'))],
+    [...Array.from({ length: 500 }, (_, i) => ({ ...row, session_id: `valid-${i}` })), { ...row, session_id: 'invalid-tail', total_input_tokens: -1 }],
+    [...Array.from({ length: 500 }, (_, i) => ({ ...row, session_id: `valid-${i}` })), { ...row, session_id: 'valid-0' }],
+  ];
+  for (const sessions of cases) {
+    const raw = await collectStored(storedFixture({ sessions }));
+    assert.equal(raw.history.sources.sessions.status, 'invalid');
+    assert.equal(raw.history.sources.sessions.data, null);
+    assert.equal(parseEvidence(raw).history.totals.sessions, null);
+    assert.equal(parseEvidence(raw).history.totals.calls, 6001);
+  }
+  const signed = await collectStored(storedFixture({ sessions: [{ ...row, first_seen_ns: Number(-9223372036854775808n), last_seen_ns: Number(9223372036854775807n) }] }));
+  assert.equal(signed.history.sources.sessions.data.total, 1);
+  for (const counts of [
+    { total: 1, by_severity: { critical: 0, high: 0, medium: 0, low: 0 } },
+    { total: 0, by_severity: { critical: 0, high: -1, medium: 1, low: 0 } },
+    { total: 0, by_severity: { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 } },
+    { total: Number.MAX_SAFE_INTEGER, by_severity: { critical: Number.MAX_SAFE_INTEGER, high: 1, medium: 0, low: 0 } },
+    { total: Number.MAX_SAFE_INTEGER + 1, by_severity: { critical: Number.MAX_SAFE_INTEGER + 1, high: 0, medium: 0, low: 0 } },
+  ]) {
+    const raw = await collectStored(storedFixture({ counts }));
+    assert.equal(raw.history.sources.interruptionCounts.status, 'invalid');
+    const report = parseEvidence(raw);
+    assert.deepEqual([report.history.totals.unresolved, report.history.totals.critical, report.history.totals.high], [null, null, null]);
+    assert.equal(report.history.totals.calls, 6001);
+  }
+});
+
+test('stored history isolated: MIME and HTTP failures remain independent without sampled usage fallback', async () => {
+  for (const key of ['usage', 'sessions', 'interruptionCounts']) {
+    for (const status of [401, 403, 404, 405, 500, 503]) {
+      const raw = await collectStored(storedFixture({ overrides: { [key]: () => new Response('private-server-error', { status }) } }));
+      assert.equal(raw.history.sources[key].status, 'unavailable');
+      assert.equal(raw.history.sources[key].data, null);
+      assert.doesNotMatch(JSON.stringify(raw), /private-server-error/);
+      assert.equal(Object.values(raw.history.sources).filter(source => source.status === 'available').length, 2);
+    }
+    for (const mime of key === 'usage' ? ['', 'application/json', 'text/plainly', 'text/html'] : ['', 'text/plain', 'application/jsonp']) {
+      const raw = await collectStored(storedFixture({ overrides: { [key]: () => new Response('{}', { headers: { 'content-type': mime } }) } }));
+      assert.equal(raw.history.sources[key].data, null);
+      assert.equal(raw.history.sources[key].status, 'invalid');
+      assert.equal(raw.sources.sessions.status, 'available');
+    }
+    const badUtf8 = await collectStored(storedFixture({ overrides: { [key]: () => new Response(new Uint8Array([0xff]), {
+      headers: { 'content-type': key === 'usage' ? 'text/plain' : 'application/json' },
+    }) } }));
+    assert.equal(badUtf8.history.sources[key].status, 'invalid');
+    assert.equal(badUtf8.history.sources[key].data, null);
+    if (key !== 'usage') {
+      const badJson = await collectStored(storedFixture({ overrides: { [key]: () => new Response('{', { headers: { 'content-type': 'application/json' } }) } }));
+      assert.equal(badJson.history.sources[key].status, 'invalid');
+      assert.equal(badJson.history.sources[key].data, null);
+    }
+  }
+});
+
+test('stored history isolated: streaming 2 MiB caps cancel reads without splits or false empty totals', async () => {
+  const cap = 2 * 1024 * 1024;
+  const jsonBody = '[]' + ' '.repeat(cap - 2);
+  let raw = await collectStored(storedFixture({ overrides: { sessions: () => new Response(jsonBody, { headers: { 'content-type': 'application/json' } }) } }));
+  assert.deepEqual(raw.history.sources.sessions.data, { total: 0 });
+  for (const key of ['usage', 'sessions', 'interruptionCounts']) {
+    for (const declared of [false, true]) {
+      let cancelled = 0;
+      const fixture = storedFixture({ overrides: { [key]: () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new Uint8Array(cap)); controller.enqueue(new Uint8Array(1)); },
+        cancel() { cancelled++; },
+      }), { headers: { 'content-type': key === 'usage' ? 'text/plain' : 'application/json', ...(declared ? { 'content-length': String(cap + 1) } : {}) } }) } });
+      raw = await collectStored(fixture);
+      assert.equal(raw.history.sources[key].status, 'invalid');
+      assert.equal(raw.history.sources[key].data, null);
+      assert.match(raw.history.sources[key].reason, /2 MiB/);
+      assert.equal(cancelled, 1);
+      assert.equal(fixture.seen.length, 8, 'Response-cap failures must never issue unlimited splits or retries');
+      assert.equal(fixture.seen.filter(item => item.key === key).length, 1);
+    }
+  }
+});
+
+test('stored history isolated: timeout and external cancellation cover headers and streamed bodies', async () => {
+  const keepAlive = setTimeout(() => assert.fail('Mock reads must settle promptly'), 2000);
+  try {
+    for (const key of ['usage', 'sessions', 'interruptionCounts']) {
+      for (const streaming of [false, true]) {
+        let cancelled = 0;
+        const override = streaming ? () => new Response(new ReadableStream({ cancel() { cancelled++; } }), {
+          headers: { 'content-type': key === 'usage' ? 'text/plain' : 'application/json' },
+        }) : (_url, init) => new Promise((resolve, reject) => {
+          init.signal.addEventListener('abort', () => { cancelled++; reject(init.signal.reason); }, { once: true });
+        });
+        const raw = await collectStored(storedFixture({ overrides: { [key]: override } }), { timeoutMs: 20 });
+        assert.equal(raw.history.sources[key].status, 'unavailable');
+        assert.equal(raw.history.sources[key].data, null);
+        assert.match(raw.history.sources[key].reason, /超时/);
+        assert.equal(cancelled, 1);
+        assert.equal(raw.sources.sessions.status, 'available');
+      }
+    }
+    const stopped = new AbortController();
+    let ready;
+    const started = new Promise(resolve => { ready = resolve; });
+    let cancelled = 0;
+    const fixture = storedFixture({ overrides: { sessions: () => {
+      ready();
+      return new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { 'content-type': 'application/json' } });
+    } } });
+    const pending = collectStored(fixture, { signal: stopped.signal });
+    const rejected = assert.rejects(pending, { code: 'COLLECTION_CANCELLED' });
+    await started; stopped.abort(); await rejected;
+    assert.equal(cancelled, 1);
+    const beforeHeaders = new AbortController();
+    let headersReady;
+    const headersStarted = new Promise(resolve => { headersReady = resolve; });
+    let headerCancelled = 0;
+    const headerFixture = storedFixture({ overrides: { usage: (_url, init) => new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => { headerCancelled++; reject(init.signal.reason); }, { once: true });
+      headersReady();
+    }) } });
+    const headerPending = collectStored(headerFixture, { signal: beforeHeaders.signal });
+    const headerRejected = assert.rejects(headerPending, { code: 'COLLECTION_CANCELLED' });
+    await headersStarted; beforeHeaders.abort(); await headerRejected;
+    assert.equal(headerCancelled, 1);
+    const alreadyStopped = storedFixture();
+    await assert.rejects(collectStored(alreadyStopped, { signal: AbortSignal.abort() }), { code: 'COLLECTION_CANCELLED' });
+    assert.equal(alreadyStopped.seen.length, 0);
+  } finally { clearTimeout(keepAlive); }
 });
 
 // Startup-management fixtures never touch an installed binary, config or credentials.

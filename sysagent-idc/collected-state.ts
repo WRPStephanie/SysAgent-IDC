@@ -147,7 +147,7 @@ function energyResource(raw: ObjectValue, resource: ResourceSnapshot) {
   for (const zone of entries(data.zones).slice(0, 32)) {
     if (typeof zone.name !== 'string' || seen.has(zone.name) || !number(zone.watts)) continue;
     seen.add(zone.name);
-    resource.rows.push(row(`rapl-${zone.name}`, text(zone.label, zone.name), 'CPU package RAPL 能量差分；非整机功耗', zone.watts, { quantity: { value: zone.watts, unit: 'W' } }));
+    resource.rows.push(row(`rapl-${zone.name}`, text(zone.label, zone.name), 'CPU · 测量', zone.watts, { quantity: { value: zone.watts, unit: 'W' }, powerSource: 'rapl' }));
   }
   if (!resource.rows.length) return;
   resource.quantity = { value: watts, unit: 'W' };
@@ -155,6 +155,76 @@ function energyResource(raw: ObjectValue, resource: ResourceSnapshot) {
   const unresolved = data.unresolved_wrap;
   const denied = data.denied;
   if (data.nr_zones !== resource.rows.length || number(unresolved) && unresolved > 0 || number(denied) && denied > 0) resource.status = 'partial';
+  resource.rows.sort((a, b) => b.usage - a.usage);
+}
+function powerReference(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw || !/^\d+(?:\.\d+)?$/.test(raw.trim())) return;
+  const watts = Number(raw);
+  return positive(watts) && watts <= 100000 ? watts : undefined;
+}
+function powerResource(raw: ObjectValue, output: HealthState['resources'], gpuInventoryComplete: boolean, noGpu: boolean) {
+  const resource = output.energy;
+  let cpuMissing = resource.status === 'partial';
+  if (!resource.rows.length) {
+    const count = section(raw, 'cpu')?.cpu_count;
+    const reference = powerReference('SYSAGENT_CPU_FULL_LOAD_WATTS') ?? (positive(count) && Number.isSafeInteger(count) && count <= 20000 ? count * 5 : undefined);
+    if (reference !== undefined && output.cpu.usage !== null) {
+      const watts = reference * output.cpu.usage / 100;
+      resource.rows.push(row('power-cpu', 'CPU', 'CPU · 估算', watts, { quantity: { value: watts, unit: 'W' }, powerSource: 'cpu-model', referenceWatts: reference }));
+      cpuMissing = output.cpu.status !== 'available';
+    } else cpuMissing = true;
+  }
+  const cpuRows = resource.rows.slice();
+  const devices = noGpu ? [] : output.gpu.gpuDevices ?? [];
+  let gpuMissing = !noGpu && (!devices.length || !gpuInventoryComplete);
+  for (const device of devices) {
+    const reference = powerReference('SYSAGENT_GPU_FULL_LOAD_WATTS') ?? (positive(device.powerLimitWatts) ? device.powerLimitWatts : 150);
+    const watts = device.powerWatts ?? (device.utilization !== null ? reference * device.utilization / 100 : null);
+    if (watts === null) { gpuMissing = true; continue; }
+    const estimated = device.powerWatts === null;
+    resource.rows.push(row(`power-gpu-${device.index}`, device.name || `GPU ${device.index}`, `GPU ${device.index} · ${estimated ? '估算' : '测量'}`, watts, {
+      quantity: { value: watts, unit: 'W' }, powerSource: estimated ? 'gpu-model' : 'gpu-sensor', ...(estimated ? { referenceWatts: reference } : {}),
+    }));
+  }
+  const gpuRows = resource.rows.slice(cpuRows.length);
+  const estimated = resource.rows.some(item => item.powerSource === 'cpu-model' || item.powerSource === 'gpu-model');
+  const measured = resource.rows.some(item => item.powerSource === 'rapl' || item.powerSource === 'gpu-sensor');
+  const missing: Array<'cpu' | 'gpu'> = [...(cpuMissing ? ['cpu' as const] : []), ...(gpuMissing ? ['gpu' as const] : [])];
+  const cpuWatts = cpuRows.length ? cpuRows.reduce((sum, item) => sum + item.usage, 0) : null;
+  const cpu = section(raw, 'cpu');
+  const process = section(raw, 'process');
+  const cpuUsage = obj(cpu?.total) ? cpu.total.usage_pct : undefined;
+  const cpuWindow = cpu?.sample_window_ms;
+  const processWindow = process?.sample_window_ms;
+  const matchingWindow = positive(cpuWindow) && positive(processWindow) &&
+    Math.abs(cpuWindow - processWindow) <= Math.max(2, cpuWindow * 0.01);
+  const samples = new Map<string, number>(entries(process?.top_cpu).flatMap(item => {
+    const identity = identityOf(item);
+    return identity && number(item.cpu_pct_node) && item.cpu_pct_node <= 100 ? [[`process-${identity.pid}-${identity.starttime}`, item.cpu_pct_node] as const] : [];
+  }));
+  const sampleUsage = [...samples.values()].reduce((sum, value) => sum + value, 0);
+  const attributable = usable(cpu) && usable(process) && matchingWindow && cpuWatts !== null && number(cpuUsage) && cpuUsage <= 100 &&
+    sampleUsage <= cpuUsage && (cpuUsage > 0 || cpuWatts === 0);
+  const processes = attributable ? output.cpu.rows.map(item => {
+    const watts = cpuUsage! > 0 ? cpuWatts! * samples.get(item.id)! / cpuUsage! : 0;
+    return row(item.id, item.name, `PID ${item.pid} · CPU 占比 ${samples.get(item.id)}% · 功率估算，非逐进程实测`, watts, {
+      pid: item.pid, starttime: item.starttime, ...(item.agentKind ? { agentKind: item.agentKind } : {}), quantity: { value: watts, unit: 'W' },
+    });
+  }) : [];
+  resource.power = {
+    method: estimated && measured ? 'mixed' : estimated ? 'estimated' : measured ? 'measured' : 'unavailable',
+    cpuWatts,
+    gpuWatts: gpuRows.length ? gpuRows.reduce((sum, item) => sum + item.usage, 0) : null,
+    missing,
+    processes,
+    unattributedCpuWatts: cpuWatts === null ? null : Math.max(0, cpuWatts - processes.reduce((sum, item) => sum + item.usage, 0)),
+  };
+  resource.usage = null;
+  resource.quantity = resource.rows.length ? { value: resource.rows.reduce((sum, item) => sum + item.usage, 0), unit: 'W' } : undefined;
+  resource.status = !resource.quantity ? 'unavailable' : missing.length ? 'partial' : 'available';
+  resource.rankLabel = '进程 CPU 功率估算';
+  resource.note = `${noGpu ? 'CPU' : 'CPU + GPU'}${missing.length ? ' · 部分覆盖' : ''}；进程功率按整机忙碌 CPU 占比分摊估算，不是逐进程实测；仅覆盖 CPU 进程采样排行，未归因部分不分摊${noGpu ? '' : '，GPU 功率未归因到进程'}`;
   resource.rows.sort((a, b) => b.usage - a.usage);
 }
 function inspection(id: string, label: string, important: boolean, phase: 1 | 2): Inspection {
@@ -388,7 +458,7 @@ export function parseCollectedState(raw: ObjectValue, previous: HealthState | un
   const sampledAt = String((raw.collection as ObjectValue).finished_at);
   const resource = (id: ResourceId): ResourceSnapshot => ({
     id, label: resourceLabels[id], usage: null, capacity: null, unit: id === 'energy' ? 'W' : '%', source: 'sysak', status: 'unavailable', note: '接口缺失、权限受限或有效样本不足；不使用模拟值补齐', sampledAt, rows: [],
-    rankLabel: id === 'disk' ? '进程读写吞吐排行' : id === 'energy' ? 'CPU package 功率' : id === 'gpu' ? 'GPU 设备利用率' : id === 'memory' ? '进程常驻内存排行' : '进程 CPU 利用率排行', rankUnit: id === 'disk' ? 'B/s' : id === 'energy' ? 'W' : '%',
+    rankLabel: id === 'disk' ? '进程读写吞吐排行' : id === 'energy' ? 'CPU / GPU 功率' : id === 'gpu' ? 'GPU 设备利用率' : id === 'memory' ? '进程常驻内存排行' : '进程 CPU 利用率排行', rankUnit: id === 'disk' ? 'B/s' : id === 'energy' ? 'W' : '%',
   });
   const output: HealthState['resources'] = { cpu: resource('cpu'), energy: resource('energy'), memory: resource('memory'), disk: resource('disk'), gpu: resource('gpu') };
   const cpu = section(raw, 'cpu');
@@ -427,6 +497,9 @@ export function parseCollectedState(raw: ObjectValue, previous: HealthState | un
   let hasGpu = gpuResource(raw, output.gpu);
   energyResource(raw, output.energy);
   processRows(raw, output, positive(memoryTotal) ? memoryTotal * 1024 : undefined);
+  const gpuData = section(raw, 'gpu');
+  let gpuInventoryComplete = gpuData?.status === 'ok' && gpuData.available === true && Array.isArray(gpuData.devices) &&
+    gpuData.devices.length === output.gpu.gpuDevices?.length && gpuData.gpu_count === output.gpu.gpuDevices.length;
   const inspections = !reset && previous?.mode === 'collected' ? structuredClone(previous.inspections) : [
     inspection('root', '根目录诊断', true, 1), inspection('memory', '内存诊断', true, 1), inspection('fd', 'FD 诊断', true, 1),
     inspection('agents', 'Agent 状态', false, 1), inspection('logs', '日志诊断', false, 1), inspection('gpu', 'GPU 诊断', false, 1),
@@ -455,6 +528,7 @@ export function parseCollectedState(raw: ObjectValue, previous: HealthState | un
       const used = metrics.reduce((sum, device) => sum + (device.memoryUsedBytes ?? 0), 0);
       const total = metrics.reduce((sum, device) => sum + (device.memoryTotalBytes ?? 0), 0);
       const inventoryComplete = gpuReport.gpuCount === metrics.length && Array.isArray(aiEvidence?.gpu_metrics) && metrics.length === aiEvidence.gpu_metrics.length;
+      gpuInventoryComplete = inventoryComplete && obj(diagnostics.ai) && diagnostics.ai.status === 'ok' && aiEvidence?.status === 'ok';
       const memoryComplete = inventoryComplete && metrics.every(device => device.memoryUsedBytes !== null && device.memoryTotalBytes !== null) && Number.isSafeInteger(used) && Number.isSafeInteger(total);
       output.gpu.quantity = memoryComplete ? { value: used, total, unit: 'B' } : undefined;
       measured(output.gpu, utilization.length ? Math.max(...utilization) : null, diagnostics.ai, 'sysak ai 原生 / NVML 本机逐卡证据；指标窗口未提供，设备名称、UUID 与 PCI 身份不可用，不与其他快照按序号关联；缺失指标不补齐，资源指标不是硬件健康结论');
@@ -486,6 +560,7 @@ export function parseCollectedState(raw: ObjectValue, previous: HealthState | un
       if (gpuReport.outcome === 'no_gpu' && !output.gpu.gpuDevices?.length && !output.gpu.rows.length) hasGpu = false;
     }
   }
+  powerResource(raw, output, gpuInventoryComplete, !hasGpu);
   const revision = previous ? previous.revision + 1 : inspect ? 2 : 1;
   const operations = reset ? [] : structuredClone(previous?.operations ?? []);
   if (inspect) operations.unshift({ id: `inspect-${revision}`, kind: 'inspect', names: ['sysAK idc_inspect 1.1：disk.mounts / memory / fd / log / gpu'], time: sampledAt, revision });

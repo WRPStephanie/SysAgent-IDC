@@ -98,7 +98,7 @@ export function HealthPerformance({
             {snapshot.usage !== null && snapshot.status !== 'unavailable' ? <>{snapshot.usage}<small>%</small></> : formatResourceValue(snapshot)}
           </strong>
           <span>
-            {collected ? '当前采集值' : '当前演示状态'}
+            {collected ? snapshot.power?.method === 'estimated' ? '当前估算值' : snapshot.power?.method === 'mixed' ? '当前功率 · 混合' : '当前采集值' : '当前演示状态'}
             <span>
               {collected ? localTime(snapshot.sampledAt ?? state.sampledAt) : '14:00–14:30 示意窗口'}
             </span>
@@ -138,10 +138,10 @@ export function HealthPerformance({
             </strong>
           </div>
         </div></> : <p className="sh-empty">当前值不可用，无趋势数据。</p>}
-        <div className="hg-dialog-note">
+        {(!collected || selectedResource !== 'energy') && <div className="hg-dialog-note">
           <Info size={14} />
           {collected ? snapshot.note || '仅当前采集范围；缺失测量值不代表正常。' : '曲线由同一内置序列按资源状态缩放，仅示意交互，不用于判断资源间相关性或真实峰值。'}
-        </div>
+        </div>}
       </section>
       <aside className="hg-card hg-resource-context">
         <h2>
@@ -193,9 +193,9 @@ export function HealthPerformance({
             </strong>
           </div>
         </div>
-        <p>
+        {(!collected || selectedResource !== 'energy') && <p>
           {collected ? snapshot.note || '当前资源值与诊断结果独立；未采集或未检查的项目没有正常结论。' : selectedResource === "energy" ? "能耗占比根据 Demo 预算分摊到程序与 Session，非实测电量；清理空闲会话后统一刷新估算值。" : selectedResource === "cpu" ? "短时 CPU 尖峰尚未归因。查看已有证据，不根据占用率猜测具体进程。" : selectedResource === "memory" ? "结合任务预算与可用内存查看风险，避免把缓存占用直接判成泄漏。" : selectedResource === "gpu" ? "逐卡显存、温度和错误事件在 GPU 诊断页；基础正常不等于 Profiling 已完成。" : "磁盘占用与清理策略分开。删除前核对范围、保留期和恢复边界。"}
-        </p>
+        </p>}
         <button
           className="hg-button primary"
           onClick={() => onInvestigate(selectedResource === "cpu" ? "load" : selectedResource === "disk" ? "root" : selectedResource === "energy" ? "agents" : selectedResource)}

@@ -845,8 +845,16 @@ test('actual parser reads idc_inspect 1.1 cpu usage_pct, memory KiB, root mount 
   assert.equal(state.resources.disk.rankUnit, 'B/s');
   assert.equal(state.resources.energy.usage, null);
   assert.equal(state.resources.energy.unit, 'W');
-  assert.deepEqual(state.resources.energy.quantity, { value: 13, unit: 'W' });
-  assert.deepEqual(state.resources.energy.rows.map((row) => row.quantity), [{ value: 10, unit: 'W' }, { value: 3, unit: 'W' }]);
+  assert.deepEqual(state.resources.energy.quantity, { value: 128, unit: 'W' });
+  const { processes, unattributedCpuWatts, ...componentPower } = state.resources.energy.power;
+  assert.deepEqual(componentPower, { method: 'measured', cpuWatts: 13, gpuWatts: 115, missing: [] });
+  assert.equal(unattributedCpuWatts, 13 - 13 * 12.5 / 60 - 13 * 10 / 60);
+  assert.deepEqual(processes.map(row => [row.id, row.pid, row.starttime, row.quantity]), [
+    ['process-101-10', 101, 10, { value: 13 * 12.5 / 60, unit: 'W' }],
+    ['process-202-20', 202, 20, { value: 13 * 10 / 60, unit: 'W' }],
+  ]);
+  assert(processes.every(row => row.cleanable === false && row.detail.includes('估算，非逐进程实测')));
+  assert.deepEqual(state.resources.energy.rows.map((row) => row.quantity), [75, 40, 10, 3].map(value => ({ value, unit: 'W' })));
   assert.equal(state.hasGpu, true);
   assert.equal(state.resources.gpu.usage, 70);
   assert.deepEqual(state.resources.gpu.rows.map((row) => row.usage), [70, 40]);
@@ -1252,6 +1260,7 @@ test('OpenAPI preserves last GPU diagnosis across refresh and clears it on reset
 
 test('RAPL uses collector-computed package watts, deduplicates zones and marks partial coverage without estimating whole-host power', async (t) => {
   const body = payload();
+  body.raw_snapshot.sections.gpu = { status: 'unavailable', reason: 'RAPL-only fixture' };
   const energy = body.raw_snapshot.sections.energy;
   energy.total_watts = 10;
   energy.zones = [
@@ -1278,6 +1287,8 @@ test('RAPL uses collector-computed package watts, deduplicates zones and marks p
   ];
   for (const [name, mutate] of cases) await t.test(name, () => {
     const invalid = payload();
+    invalid.raw_snapshot.sections.cpu = { status: 'unavailable', reason: 'fixture' };
+    invalid.raw_snapshot.sections.gpu = { status: 'unavailable', reason: 'fixture' };
     mutate(invalid.raw_snapshot.sections);
     const item = parsed(invalid).resources.energy;
     assert.equal(item.usage, null);
@@ -1286,6 +1297,7 @@ test('RAPL uses collector-computed package watts, deduplicates zones and marks p
   });
   for (const [field, value] of [['unresolved_wrap', 1], ['denied', 2]]) {
     const partial = payload();
+    partial.raw_snapshot.sections.gpu = { status: 'unavailable', reason: 'RAPL-only fixture' };
     partial.raw_snapshot.sections.energy[field] = value;
     const item = parsed(partial).resources.energy;
     assert.deepEqual(item.quantity, { value: 13, unit: 'W' });

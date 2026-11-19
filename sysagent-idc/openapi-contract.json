@@ -32,7 +32,7 @@
       "post": {
         "operationId": "submitAgentDiagnostics",
         "summary": "Interpret independent AgentSight evidence using local read-only rules",
-        "description": "AgentSight is not a sysak collector. No existing device snapshot or revision is required; this route never reads or changes sysak snapshot state or consumes device capacity. Uncompressed UTF-8 JSON: 10 MiB request, 8 MiB original raw_snapshot including whitespace. request_id shares the last-100 FIFO result/task cache with collections; identical bytes on the same route replay, different bytes or route return 409. Successful submission means parsing completed, NOT Agent health. Missing sources are unavailable, malformed individual sources fail closed as invalid without interpreting any of their rows. Oversized or upstream truncated lists are bounded and explicitly truncated, not complete. process/session/interruption/latency limits: 256/500/200/1; latency is a single object, not an array. Sessions and Token totals describe only the complete collected session list (usually upstream 24h, auxiliary calls excluded by default), never all window calls; truncated session totals are null. Whole-window unresolved/critical/high totals come only from valid complete interruptionCounts, never the 200-row unresolved list. Null metrics remain null. Nanosecond numeric precision is used only for timestamp display, not IDs. Zero or older-than-2-minute scan yields unknown probe conclusions; this threshold measures freshness only. healthy means any HTTP status response, no_port may be a normal CLI, offline without has_crash is not a crash. hung/unhealthy, offline with has_crash and unresolved events produce observations and manual suggestions, never confirmed root causes. No data yields unknown. Five valid complete sources yield status ok, some usable sources partial, none unavailable; coverage gaps without definite abnormalities remain unknown. No LLM, external calls, resolve, restart or process operations. Raw evidence is neither returned nor retained.",
+        "description": "AgentSight is not a sysak collector. No existing device snapshot or revision is required; this route never reads or changes sysak snapshot state or consumes device capacity. Uncompressed UTF-8 JSON: 10 MiB request, 8 MiB original raw_snapshot including whitespace. request_id shares the last-100 FIFO result/task cache with collections; identical bytes on the same route replay, different bytes or route return 409. Successful submission means parsing completed, NOT Agent health. Missing sources are unavailable, malformed individual sources fail closed as invalid without interpreting any of their rows. Oversized or upstream truncated AgentSight lists are bounded and explicitly truncated, not complete. process/session/interruption/latency limits: 256/500/200/256; latency is an array of agent-group complete-call summaries. Sessions and Token totals describe only the complete collected session list (usually upstream 24h, including auxiliary calls and cached input usage), not session lifetime totals; truncated session totals are null. Calls without reported usage may be recorded as zero. Whole-window unresolved/critical/high totals come only from valid complete interruptionCounts, never the 200-row unresolved list. Null metrics remain null. Nanosecond numeric precision is used only for timestamp display, not IDs. Zero or older-than-2-minute scan yields unknown probe conclusions; this threshold measures freshness only. healthy means any HTTP status response, no_port may be a normal CLI, offline without has_crash is not a crash. hung/unhealthy, offline with has_crash and unresolved events produce observations and manual suggestions, never confirmed root causes. Five valid complete AgentSight sources yield status ok, some usable sources partial, none unavailable. Optional top-level raw_snapshot.hooks carries independent metadata only, never a sources entry: at most 5000 events, 16 agents, latest 200 report events. Any malformed Hook source, invalid row/ID/window, duplicate ID or exceeded Hook limit returns HTTP 200 with hooks.invalid and empty Hook evidence, without rejecting the request or changing AgentSight coverage/status. Hook metadata contains no prompt text, tool I/O, error body or token usage and is never linked to AgentSight process/session identities. Hook tool failure, cancellation, permission denial and unmatched starts alone do not prove Agent fault or hang; turn failures are recorded observations, not confirmed root causes. No data yields unknown. No LLM, external calls, resolve, restart or process operations. Raw evidence is neither returned nor retained.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentDiagnosticRequest" } } } },
         "responses": {
           "200": { "description": "Completed interpretation, including partial/unavailable evidence; not a health assertion", "headers": { "Cache-Control": { "$ref": "#/components/headers/NoStore" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentDiagnosticResponse" } } } },
@@ -219,12 +219,13 @@
       },
       "AgentDiagnosticCapabilities": {
         "type": "object", "additionalProperties": false,
-        "required": ["route", "method", "source", "operation", "independent_evidence", "requires_sysak_snapshot", "requires_revision", "mutates_sysak_snapshot", "analyzer", "external_calls", "source_limits"],
+        "required": ["route", "method", "source", "operation", "independent_evidence", "requires_sysak_snapshot", "requires_revision", "mutates_sysak_snapshot", "analyzer", "external_calls", "source_limits", "hook_limits"],
         "properties": {
           "route": { "const": "/openapi/v1/agent-diagnostics" }, "method": { "const": "POST" }, "source": { "const": "agentsight" }, "operation": { "const": "agent-diagnose" },
           "independent_evidence": { "const": true }, "requires_sysak_snapshot": { "const": false }, "requires_revision": { "const": false }, "mutates_sysak_snapshot": { "const": false },
           "analyzer": { "const": "local-rules" }, "external_calls": { "const": false },
-          "source_limits": { "type": "object", "additionalProperties": false, "required": ["processes", "sessions", "interruptions", "interruptionCounts", "latency"], "properties": { "processes": { "const": 256 }, "sessions": { "const": 500 }, "interruptions": { "const": 200 }, "interruptionCounts": { "const": 1 }, "latency": { "const": 256 } } }
+          "source_limits": { "type": "object", "additionalProperties": false, "required": ["processes", "sessions", "interruptions", "interruptionCounts", "latency"], "properties": { "processes": { "const": 256 }, "sessions": { "const": 500 }, "interruptions": { "const": 200 }, "interruptionCounts": { "const": 1 }, "latency": { "const": 256 } } },
+          "hook_limits": { "type": "object", "additionalProperties": false, "required": ["events", "recent", "agents"], "properties": { "events": { "const": 5000 }, "recent": { "const": 200 }, "agents": { "const": 16 } } }
         }
       },
       "AgentDiagnosticRequest": {
@@ -239,6 +240,8 @@
         "required": ["schema_version", "source", "sampled_at", "window", "sources"],
         "properties": {
           "schema_version": { "$ref": "#/components/schemas/AgentVersion" }, "source": { "const": "agentsight" }, "sampled_at": { "$ref": "#/components/schemas/AgentDateTime" }, "window": { "$ref": "#/components/schemas/AgentWindow" },
+          "history": { "$ref": "#/components/schemas/AgentRawStoredHistory" },
+          "hooks": { "$ref": "#/components/schemas/AgentRawHookSource", "x-valid-data-schema": "#/components/schemas/AgentRawHooks", "description": "Optional independent top-level Hook metadata, not a sources entry. Missing is hooks.unavailable; semantic failures return HTTP 200 with hooks.invalid and no Hook rows, without rejecting the request or changing the five AgentSight coverage entries/status." },
           "sources": {
             "type": "object", "additionalProperties": false, "description": "Sources may be missing or unavailable. Invalid individual source content is accepted only to report invalid coverage, not interpreted as evidence. No command lines, paths, user questions or interruption detail fields.",
             "properties": {
@@ -249,6 +252,28 @@
               "latency": { "$ref": "#/components/schemas/AgentRawSource", "x-valid-data-schema": "#/components/schemas/AgentRawLatency" }
             }
           }
+        }
+      },
+      "AgentRawStoredHistory": {
+        "type": "object", "additionalProperties": false, "required": ["scope", "sampled_at", "sources"],
+        "properties": {
+          "scope": { "const": "all_stored" }, "sampled_at": { "$ref": "#/components/schemas/AgentDateTime" },
+          "sources": { "type": "object", "additionalProperties": false, "required": ["usage", "sessions", "interruptionCounts"], "properties": {
+            "usage": { "$ref": "#/components/schemas/AgentRawSource", "description": "Safe integer calls/inputTokens/outputTokens from AgentSight unwindowed /metrics over its retained records; includes auxiliary and unattributed calls. Never add cache tokens again." },
+            "sessions": { "$ref": "#/components/schemas/AgentRawSource", "description": "Safe integer total from the complete retained-session response before the 500-row detail projection. Incomplete responses remain unknown; AgentSight retention rules still apply." },
+            "interruptionCounts": { "$ref": "#/components/schemas/AgentRawSource", "x-valid-data-schema": "#/components/schemas/AgentRawInterruptionCounts" }
+          } }
+        },
+        "description": "Independent AgentSight retained-history aggregates, separate from the 24h detail window and detail row limits. AgentSight data retention and source completeness still apply; deleted history cannot be recovered. No current-health influence, raw metric labels or conversation content. Individual source failures preserve other sources."
+      },
+      "AgentStoredHistory": {
+        "type": "object", "additionalProperties": false, "required": ["scope", "sampledAt", "status", "coverage", "totals"],
+        "properties": {
+          "scope": { "const": "all_stored" }, "sampledAt": { "$ref": "#/components/schemas/AgentDateTime" }, "status": { "type": "string", "enum": ["ok", "partial", "unavailable"] },
+          "coverage": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "object", "additionalProperties": false, "required": ["key", "status", "reason"], "properties": { "key": { "type": "string", "enum": ["usage", "sessions", "interruptionCounts"] }, "status": { "$ref": "#/components/schemas/AgentSourceStatus" }, "reason": { "type": "string", "maxLength": 512 } } } },
+          "totals": { "type": "object", "additionalProperties": false, "required": ["sessions", "calls", "inputTokens", "outputTokens", "unresolved", "critical", "high"], "properties": {
+            "sessions": { "$ref": "#/components/schemas/AgentNullableInteger" }, "calls": { "$ref": "#/components/schemas/AgentNullableInteger" }, "inputTokens": { "$ref": "#/components/schemas/AgentNullableInteger" }, "outputTokens": { "$ref": "#/components/schemas/AgentNullableInteger" }, "unresolved": { "$ref": "#/components/schemas/AgentNullableInteger" }, "critical": { "$ref": "#/components/schemas/AgentNullableInteger" }, "high": { "$ref": "#/components/schemas/AgentNullableInteger" }
+          } }
         }
       },
       "AgentRawSource": {
@@ -294,6 +319,81 @@
         "description": "One agent group for complete calls only; streaming_call_count <= call_count. Null agent_name and null quantiles stay null.",
         "properties": { "agent_name": { "$ref": "#/components/schemas/AgentNullableText" }, "call_count": { "$ref": "#/components/schemas/AgentInteger" }, "streaming_call_count": { "$ref": "#/components/schemas/AgentInteger" }, "ttft_ms": { "$ref": "#/components/schemas/AgentQuantiles" }, "tps_tokens_per_second": { "$ref": "#/components/schemas/AgentQuantiles" }, "tpot_ms_per_token": { "$ref": "#/components/schemas/AgentQuantiles" }, "e2e_latency_ms": { "$ref": "#/components/schemas/AgentQuantiles" } }
       },
+      "AgentHookId": { "type": "string", "minLength": 16, "maxLength": 16, "pattern": "^[a-f0-9]{16}$" },
+      "AgentHookAgent": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+      "AgentHookIdentifier": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:@/+\\-]{1,128}$" },
+      "AgentHookLabel": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:@/+ \\-]{1,128}$" },
+      "AgentHookDateTime": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}Z$", "description": "Strict valid calendar ISO timestamp with exactly three millisecond digits and Z; must round-trip through Date.toISOString(). Every event is within the inclusive AgentWindow." },
+      "AgentHookKind": { "type": "string", "enum": ["session_start", "session_end", "prompt_submit", "tool_start", "tool_end", "tool_failure", "permission_request", "permission_denied", "turn_stop", "turn_failure", "notification", "subagent_start", "subagent_stop", "task_created", "task_completed", "teammate_idle", "elicitation", "elicitation_result", "compact", "compact_completed"] },
+      "AgentHookCount": { "type": "integer", "minimum": 0, "maximum": 5000 },
+      "AgentHookHistoryTotals": {
+        "type": "object", "additionalProperties": false,
+        "required": ["sessions", "events", "prompts", "toolStarts", "toolEnds", "toolFailures", "interrupts", "permissionDenied", "turnFailures", "openTools"],
+        "properties": {
+          "sessions": { "$ref": "#/components/schemas/AgentNullableInteger" }, "events": { "$ref": "#/components/schemas/AgentNullableInteger" }, "prompts": { "$ref": "#/components/schemas/AgentNullableInteger" }, "toolStarts": { "$ref": "#/components/schemas/AgentNullableInteger" }, "toolEnds": { "$ref": "#/components/schemas/AgentNullableInteger" }, "toolFailures": { "$ref": "#/components/schemas/AgentNullableInteger" }, "interrupts": { "$ref": "#/components/schemas/AgentNullableInteger" }, "permissionDenied": { "$ref": "#/components/schemas/AgentNullableInteger" }, "turnFailures": { "$ref": "#/components/schemas/AgentNullableInteger" }, "openTools": { "$ref": "#/components/schemas/AgentNullableInteger" }
+        }
+      },
+      "AgentHookHistoryActivity": {
+        "type": "object", "additionalProperties": false, "required": ["events", "range", "reason", "kinds", "bins", "sessions", "tools", "subagents"],
+        "properties": {
+          "events": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+          "range": { "type": "object", "additionalProperties": false, "required": ["start", "end"], "properties": { "start": { "$ref": "#/components/schemas/AgentNullableDateTime" }, "end": { "$ref": "#/components/schemas/AgentNullableDateTime" } } },
+          "reason": { "type": "string", "maxLength": 512 },
+          "kinds": { "type": "array", "minItems": 20, "maxItems": 20, "items": { "type": "object", "additionalProperties": false, "required": ["kind", "count"], "properties": { "kind": { "$ref": "#/components/schemas/AgentHookKind" }, "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } } } },
+          "bins": { "type": "array", "maxItems": 12, "items": { "type": "object", "additionalProperties": false, "required": ["start", "end", "count", "failures", "interrupts"], "properties": { "start": { "$ref": "#/components/schemas/AgentHookDateTime" }, "end": { "$ref": "#/components/schemas/AgentHookDateTime" }, "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "failures": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "interrupts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } } } },
+          "sessions": { "type": "array", "maxItems": 8, "items": { "type": "object", "additionalProperties": false, "required": ["key", "agent", "events", "prompts", "toolStarts", "turnFailures", "firstEventAt", "lastEventAt"], "properties": { "key": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "agent": { "$ref": "#/components/schemas/AgentHookAgent" }, "events": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "prompts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "toolStarts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "turnFailures": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "firstEventAt": { "$ref": "#/components/schemas/AgentHookDateTime" }, "lastEventAt": { "$ref": "#/components/schemas/AgentHookDateTime" } } } },
+          "tools": { "type": "array", "maxItems": 64, "items": { "type": "object", "additionalProperties": false, "required": ["tool", "starts", "ends", "failures", "interrupts", "unmatched"], "properties": { "tool": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:@/+\\-]{1,128}$" }, "starts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "ends": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "failures": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "interrupts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "unmatched": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } } } },
+          "subagents": { "type": "array", "maxItems": 64, "items": { "type": "object", "additionalProperties": false, "required": ["subagent", "starts", "stops"], "properties": { "subagent": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:@/+ \\-]{1,128}$" }, "starts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }, "stops": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 } } } }
+        },
+        "description": "Bounded projection of full cumulative metadata: 20 kind counters, at most 12 time bins, 8 irreversibly hashed session rows, 64 tools and 64 subagents. It contains no raw historical events or session IDs."
+      },
+      "AgentHookHistory": {
+        "type": "object", "additionalProperties": false, "required": ["scope", "status", "reason", "sampledAt", "range", "totals", "activity"],
+        "properties": {
+          "scope": { "const": "cumulative" }, "status": { "$ref": "#/components/schemas/AgentSourceStatus" }, "reason": { "type": "string", "maxLength": 512 }, "sampledAt": { "$ref": "#/components/schemas/AgentHookDateTime" },
+          "range": { "type": "object", "additionalProperties": false, "required": ["start", "end"], "properties": { "start": { "$ref": "#/components/schemas/AgentNullableDateTime" }, "end": { "$ref": "#/components/schemas/AgentNullableDateTime" } } },
+          "totals": { "$ref": "#/components/schemas/AgentHookHistoryTotals" },
+          "activity": { "oneOf": [{ "$ref": "#/components/schemas/AgentHookHistoryActivity" }, { "type": "null" }] }
+        },
+        "description": "Independent persistent cumulative Hook counters and bounded aggregate charts, accumulated on SQLite writes with permanent event/session deduplication and no counter rotation. Unaffected by time-window, 5000-input, 200-detail or 16-agent limits. Session ranking stores only irreversible (agent, sessionId) hashes; unmatched starts use (agent, sessionId, callId). Records rotated before aggregate enablement cannot be recovered; retained details are backfilled. Only complete available aggregates have numeric totals and activity; other statuses have null totals and activity. Not current-health evidence."
+      },
+      "AgentRawHookSource": {
+        "type": "object", "additionalProperties": false, "required": ["status", "reason", "data"],
+        "description": "Independent metadata only. available/truncated requires AgentRawHooks data; unavailable/invalid requires null. Malformed source shapes, fields, counts, duplicate event_id, out-of-window events, more than 5000 events or more than 16 distinct agents invalidate the entire Hook source, returning 200 with hooks.invalid (not a request error). No raw Hook data is returned or retained.",
+        "properties": { "status": { "$ref": "#/components/schemas/AgentSourceStatus" }, "reason": { "type": "string", "maxLength": 512 }, "data": { "description": "Valid interpreted data is null or AgentRawHooks (see x-valid-data-schema); other JSON is accepted only to report hooks.invalid, never interpreted as evidence." }, "history": { "$ref": "#/components/schemas/AgentHookHistory" } }
+      },
+      "AgentRawHooks": {
+        "type": "object", "additionalProperties": false, "required": ["events", "skipped_lines"],
+        "properties": { "events": { "type": "array", "maxItems": 5000, "items": { "$ref": "#/components/schemas/AgentRawHookEvent" } }, "skipped_lines": { "$ref": "#/components/schemas/AgentInteger" } },
+        "description": "At most 5000 unique event IDs and 16 distinct agents, inclusive report window. skipped_lines is a nonnegative safe integer counting collector-discarded lines; it is not an event or health count. Invalid content discards the entire source, not only invalid rows."
+      },
+      "AgentRawHookEvent": {
+        "type": "object", "additionalProperties": false, "required": ["event_id", "agent", "kind", "occurred_at", "session_id", "tool", "call_id", "error_type", "interrupt", "subagent", "model"],
+        "properties": {
+          "event_id": { "$ref": "#/components/schemas/AgentHookId" }, "agent": { "$ref": "#/components/schemas/AgentHookAgent" }, "kind": { "$ref": "#/components/schemas/AgentHookKind" }, "occurred_at": { "$ref": "#/components/schemas/AgentHookDateTime" },
+          "session_id": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "tool": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "call_id": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "error_type": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "interrupt": { "type": ["boolean", "null"] }, "subagent": { "$ref": "#/components/schemas/AgentHookLabel" }, "model": { "$ref": "#/components/schemas/AgentHookLabel" }
+        },
+        "description": "Exact metadata whitelist. No prompts, tool inputs/outputs, command lines, paths, error body or token usage. IDs are metadata labels, not filesystem access or identity links to AgentSight."
+      },
+      "AgentHookEvent": {
+        "type": "object", "additionalProperties": false, "required": ["id", "agent", "kind", "occurredAt", "sessionId", "tool", "callId", "errorType", "interrupt", "subagent", "model"],
+        "properties": {
+          "id": { "$ref": "#/components/schemas/AgentHookId" }, "agent": { "$ref": "#/components/schemas/AgentHookAgent" }, "kind": { "$ref": "#/components/schemas/AgentHookKind" }, "occurredAt": { "$ref": "#/components/schemas/AgentHookDateTime" },
+          "sessionId": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "tool": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "callId": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "errorType": { "$ref": "#/components/schemas/AgentHookIdentifier" }, "interrupt": { "type": ["boolean", "null"] }, "subagent": { "$ref": "#/components/schemas/AgentHookLabel" }, "model": { "$ref": "#/components/schemas/AgentHookLabel" }
+        }
+      },
+      "AgentHookAgentSummary": {
+        "type": "object", "additionalProperties": false, "required": ["agent", "sessions", "events", "prompts", "toolStarts", "toolEnds", "toolFailures", "interrupts", "permissionDenied", "turnFailures", "openTools", "lastEventAt"],
+        "properties": {
+          "agent": { "$ref": "#/components/schemas/AgentHookAgent" }, "sessions": { "$ref": "#/components/schemas/AgentHookCount" }, "events": { "$ref": "#/components/schemas/AgentHookCount" }, "prompts": { "$ref": "#/components/schemas/AgentHookCount" }, "toolStarts": { "$ref": "#/components/schemas/AgentHookCount" }, "toolEnds": { "$ref": "#/components/schemas/AgentHookCount" }, "toolFailures": { "$ref": "#/components/schemas/AgentHookCount" }, "interrupts": { "$ref": "#/components/schemas/AgentHookCount" }, "permissionDenied": { "$ref": "#/components/schemas/AgentHookCount" }, "turnFailures": { "$ref": "#/components/schemas/AgentHookCount" }, "openTools": { "$ref": "#/components/schemas/AgentHookCount" }, "lastEventAt": { "$ref": "#/components/schemas/AgentHookDateTime" }
+        },
+        "description": "Counts cover the full accepted bounded Hook list, not just the recent 200 events. Sessions are distinct non-null Hook session IDs only. toolFailures excludes explicit interrupt=true; interrupts requires tool_failure with interrupt=true. openTools counts unmatched starts by (sessionId, callId) only when both exist; missing completions do not prove a hang."
+      },
+      "AgentHookReport": {
+        "type": "object", "additionalProperties": false, "required": ["status", "reason", "skippedLines", "agents", "events"],
+        "properties": { "status": { "$ref": "#/components/schemas/AgentSourceStatus" }, "reason": { "type": "string", "maxLength": 512 }, "skippedLines": { "$ref": "#/components/schemas/AgentNullableInteger" }, "agents": { "type": "array", "maxItems": 16, "items": { "$ref": "#/components/schemas/AgentHookAgentSummary" } }, "events": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/AgentHookEvent" } }, "history": { "$ref": "#/components/schemas/AgentHookHistory" } },
+        "description": "Required independent Hook evidence. Missing input means unavailable. unavailable/invalid yields empty arrays and skippedLines=null; available/truncated preserves skippedLines including zero. Agent summaries sort by agent; events are latest-first and limited to 200. Hook status never contributes a sixth AgentSight source or changes its coverage status. Metadata alone is not health; tool failures, cancellation, denial and open starts do not establish an Agent fault."
+      },
       "AgentProcessEvidence": {
         "type": "object", "additionalProperties": false, "required": ["pid", "name", "role", "status", "ports", "lastCheckAt", "latencyMs", "parentPid", "hasCrash"],
         "properties": { "pid": { "$ref": "#/components/schemas/AgentInteger" }, "name": { "$ref": "#/components/schemas/AgentText" }, "role": { "$ref": "#/components/schemas/AgentText" }, "status": { "$ref": "#/components/schemas/AgentProcessStatus" }, "ports": { "$ref": "#/components/schemas/AgentPorts" }, "lastCheckAt": { "$ref": "#/components/schemas/AgentNullableDateTime" }, "latencyMs": { "$ref": "#/components/schemas/AgentNullableInteger" }, "parentPid": { "$ref": "#/components/schemas/AgentNullableInteger" }, "hasCrash": { "type": "boolean" } }
@@ -312,16 +412,18 @@
       },
       "AgentDiagnostic": {
         "type": "object", "additionalProperties": false, "description": "Exact projection of src/agent-diagnostics-data.ts AgentDiagnostic. status describes evidence coverage, not health. observed asserts observations only, never normal business behavior. Clear events may yield abnormal even with partial coverage; empty, stale or incomplete evidence without clear events yields unknown.",
-        "required": ["source", "analyzer", "sampledAt", "window", "status", "outcome", "summary", "lastScanAt", "filteredProcesses", "coverage", "totals", "findings", "processes", "sessions", "interruptions", "latency"],
+        "required": ["source", "analyzer", "sampledAt", "window", "status", "outcome", "summary", "lastScanAt", "filteredProcesses", "coverage", "totals", "findings", "processes", "sessions", "interruptions", "latency", "hooks"],
         "properties": {
           "source": { "const": "agentsight" }, "analyzer": { "const": "sysom-openapi" }, "sampledAt": { "$ref": "#/components/schemas/AgentDateTime" }, "window": { "$ref": "#/components/schemas/AgentWindow" },
           "status": { "type": "string", "enum": ["ok", "partial", "unavailable"] }, "outcome": { "type": "string", "enum": ["observed", "abnormal", "unknown"] }, "summary": { "type": "string" },
           "lastScanAt": { "$ref": "#/components/schemas/AgentNullableDateTime" }, "filteredProcesses": { "$ref": "#/components/schemas/AgentNullableInteger" },
           "coverage": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "type": "object", "additionalProperties": false, "required": ["key", "status", "reason"], "properties": { "key": { "type": "string", "enum": ["processes", "sessions", "interruptions", "interruptionCounts", "latency"] }, "status": { "$ref": "#/components/schemas/AgentSourceStatus" }, "reason": { "type": "string" } } } },
           "totals": { "type": "object", "additionalProperties": false, "required": ["sessions", "inputTokens", "outputTokens", "unresolved", "critical", "high"], "properties": { "sessions": { "$ref": "#/components/schemas/AgentNullableInteger" }, "inputTokens": { "$ref": "#/components/schemas/AgentNullableInteger" }, "outputTokens": { "$ref": "#/components/schemas/AgentNullableInteger" }, "unresolved": { "$ref": "#/components/schemas/AgentNullableInteger" }, "critical": { "$ref": "#/components/schemas/AgentNullableInteger" }, "high": { "$ref": "#/components/schemas/AgentNullableInteger" } } },
-          "findings": { "type": "array", "maxItems": 462, "items": { "type": "object", "additionalProperties": false, "required": ["severity", "title", "detail", "suggestion"], "properties": { "severity": { "type": "string", "enum": ["info", "warning", "error"] }, "title": { "type": "string" }, "detail": { "type": "string" }, "suggestion": { "type": "string" } } } },
+          "findings": { "type": "array", "maxItems": 527, "items": { "type": "object", "additionalProperties": false, "required": ["severity", "title", "detail", "suggestion"], "properties": { "severity": { "type": "string", "enum": ["info", "warning", "error"] }, "title": { "type": "string" }, "detail": { "type": "string" }, "suggestion": { "type": "string" } } } },
           "processes": { "type": "array", "maxItems": 256, "items": { "$ref": "#/components/schemas/AgentProcessEvidence" } }, "sessions": { "type": "array", "maxItems": 500, "items": { "$ref": "#/components/schemas/AgentSessionEvidence" } },
-          "interruptions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/AgentInterruptionEvidence" } }, "latency": { "type": "array", "maxItems": 256, "items": { "$ref": "#/components/schemas/AgentLatencyEvidence" } }
+          "interruptions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/AgentInterruptionEvidence" } }, "latency": { "type": "array", "maxItems": 256, "items": { "$ref": "#/components/schemas/AgentLatencyEvidence" } },
+          "hooks": { "$ref": "#/components/schemas/AgentHookReport" },
+          "history": { "$ref": "#/components/schemas/AgentStoredHistory" }
         }
       },
       "AgentDiagnosticResponse": {
@@ -338,7 +440,7 @@
       },
       "ResourceRow": {
         "type": "object", "additionalProperties": false, "required": ["id", "name", "detail", "usage", "cleanable", "defaultSelected", "effect"],
-        "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "detail": { "type": "string" }, "usage": { "type": "number" }, "cleanable": { "type": "boolean" }, "defaultSelected": { "type": "boolean" }, "effect": { "type": "string" }, "pid": { "type": "integer", "minimum": 0 }, "starttime": { "type": "integer", "minimum": 0 }, "agentKind": { "type": "string" }, "quantity": { "$ref": "#/components/schemas/Quantity" }, "agentId": { "type": "string" }, "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/ResourceSession" } } }
+        "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "detail": { "type": "string" }, "usage": { "type": "number" }, "cleanable": { "type": "boolean" }, "defaultSelected": { "type": "boolean" }, "effect": { "type": "string" }, "pid": { "type": "integer", "minimum": 0 }, "starttime": { "type": "integer", "minimum": 0 }, "agentKind": { "type": "string" }, "powerSource": { "type": "string", "enum": ["rapl", "gpu-sensor", "cpu-model", "gpu-model"] }, "referenceWatts": { "type": "number", "exclusiveMinimum": 0 }, "quantity": { "$ref": "#/components/schemas/Quantity" }, "agentId": { "type": "string" }, "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/ResourceSession" } } }
       },
       "GpuDevice": {
         "type": "object", "additionalProperties": false,
@@ -390,9 +492,14 @@
           "processes": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/GpuJobProcess" } }
         }
       },
+      "PowerEstimate": {
+        "type": "object", "additionalProperties": false, "required": ["method", "cpuWatts", "gpuWatts", "missing", "processes", "unattributedCpuWatts"],
+        "description": "Known component power in watts with CPU process estimates apportioned by sampled host busy utilization, not normalized to top_n. Unattributed CPU power remains separate. Confirmed GPU absence excludes GPU calculations and uses null gpuWatts without missing GPU coverage. GPU power is not attributed to processes. No cumulative energy or session attribution.",
+        "properties": { "method": { "type": "string", "enum": ["measured", "estimated", "mixed", "unavailable"] }, "cpuWatts": { "type": ["number", "null"], "minimum": 0 }, "gpuWatts": { "type": ["number", "null"], "minimum": 0 }, "missing": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "type": "string", "enum": ["cpu", "gpu"] } }, "processes": { "type": "array", "maxItems": 40, "items": { "$ref": "#/components/schemas/ResourceRow" } }, "unattributedCpuWatts": { "type": ["number", "null"], "minimum": 0 } }
+      },
       "ResourceSnapshot": {
         "type": "object", "additionalProperties": false, "required": ["id", "label", "usage", "capacity", "unit", "rows"],
-        "properties": { "id": { "$ref": "#/components/schemas/ResourceId" }, "label": { "type": "string" }, "usage": { "type": ["number", "null"], "minimum": 0, "maximum": 100 }, "capacity": { "type": ["number", "null"] }, "unit": { "type": "string" }, "source": { "type": "string", "enum": ["sysak", "demo"] }, "status": { "type": "string", "enum": ["available", "partial", "unavailable"] }, "note": { "type": "string" }, "quantity": { "$ref": "#/components/schemas/Quantity" }, "rankLabel": { "type": "string" }, "rankUnit": { "type": "string", "enum": ["%", "B", "B/s", "W", "count"] }, "sampledAt": { "type": "string", "format": "date-time" }, "gpuDevices": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/GpuDevice" } }, "rows": { "type": "array", "items": { "$ref": "#/components/schemas/ResourceRow" } } }
+        "properties": { "id": { "$ref": "#/components/schemas/ResourceId" }, "label": { "type": "string" }, "usage": { "type": ["number", "null"], "minimum": 0, "maximum": 100 }, "capacity": { "type": ["number", "null"] }, "unit": { "type": "string" }, "source": { "type": "string", "enum": ["sysak", "demo"] }, "status": { "type": "string", "enum": ["available", "partial", "unavailable"] }, "note": { "type": "string" }, "quantity": { "$ref": "#/components/schemas/Quantity" }, "rankLabel": { "type": "string" }, "rankUnit": { "type": "string", "enum": ["%", "B", "B/s", "W", "count"] }, "sampledAt": { "type": "string", "format": "date-time" }, "gpuDevices": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/GpuDevice" } }, "power": { "$ref": "#/components/schemas/PowerEstimate" }, "rows": { "type": "array", "items": { "$ref": "#/components/schemas/ResourceRow" } } }
       },
       "Inspection": {
         "type": "object", "additionalProperties": false, "required": ["id", "label", "important", "phase", "status", "usage", "detail", "evidence"],
@@ -408,7 +515,7 @@
       },
       "HealthState": {
         "type": "object", "additionalProperties": false, "required": ["mode", "hasGpu", "revision", "sampledAt", "resources", "inspections", "optimizations", "operations"],
-        "description": "Collected real evidence in the existing UI layout. Resource usage is independently measured, never summed from top process rows. Unknown percentages are null. Quantities have explicit units. Energy is CPU package average watts, not total system energy or a budget percentage. No Agent/Session attribution, fake history or writable objects.",
+        "description": "Collected real evidence in the existing UI layout. Resource usage is independently measured, never summed from top process rows. Unknown percentages are null. Quantities have explicit units. Energy contains known CPU/GPU power subtotals, preferring sensors and falling back to utilization-based estimates with explicit provenance and missing coverage; not whole-system energy or a budget percentage. No Agent/Session attribution, fake history or writable objects.",
         "properties": {
           "mode": { "type": "string", "const": "collected" }, "hasGpu": { "type": "boolean" }, "revision": { "type": "integer", "minimum": 1 }, "sampledAt": { "type": "string", "format": "date-time" }, "gpuDiagnostic": { "$ref": "#/components/schemas/GpuDiagnostic" },
           "resources": { "type": "object", "additionalProperties": false, "required": ["cpu", "energy", "memory", "disk", "gpu"], "properties": { "cpu": { "$ref": "#/components/schemas/ResourceSnapshot" }, "energy": { "$ref": "#/components/schemas/ResourceSnapshot" }, "memory": { "$ref": "#/components/schemas/ResourceSnapshot" }, "disk": { "$ref": "#/components/schemas/ResourceSnapshot" }, "gpu": { "$ref": "#/components/schemas/ResourceSnapshot" } } },

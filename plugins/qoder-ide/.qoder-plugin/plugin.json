@@ -1,0 +1,13 @@
+{
+  "name": "sysagent-agent-hooks-ide",
+  "displayName": "SysAgent管家 Agent Hooks（Qoder IDE）",
+  "version": "0.2.19",
+  "description": "为 SysAgent管家本机 Agent 诊断记录 Qoder IDE 生命周期元数据（不含提示词、工具输入输出或文件内容），并在会话开始时附带本机只读健康缓存摘要。",
+  "author": {
+    "name": "SysAgent"
+  },
+  "license": "MIT",
+  "keywords": ["sysagent", "agent-diagnostics", "hooks", "observability", "qoder-ide"],
+  "category": "Coding",
+  "hooks": "./hooks/hooks.json"
+}

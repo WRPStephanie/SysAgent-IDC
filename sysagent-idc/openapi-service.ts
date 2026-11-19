@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import contract from './openapi-contract.json';
 import { type HealthState } from './src/health-data';
 import { parseCollectedState } from './collected-state';
-import { parseAgentDiagnostic, AgentSnapshotError, AGENT_SOURCE_LIMITS } from './agent-diagnostics';
+import { parseAgentDiagnostic, AgentSnapshotError, AGENT_SOURCE_LIMITS, AGENT_HOOK_LIMITS } from './agent-diagnostics';
 import { type AgentDiagnostic } from './src/agent-diagnostics-data';
 
 export { summarizeHealth, buildHealthReport } from './src/health-data';
@@ -311,7 +311,7 @@ export async function startMockOpenApi({ token, port = 0 }: { token: string; por
           agent_diagnostics: {
             route: '/openapi/v1/agent-diagnostics', method: 'POST', source: 'agentsight', operation: 'agent-diagnose',
             independent_evidence: true, requires_sysak_snapshot: false, requires_revision: false,
-            mutates_sysak_snapshot: false, analyzer: 'local-rules', external_calls: false, source_limits: AGENT_SOURCE_LIMITS,
+            mutates_sysak_snapshot: false, analyzer: 'local-rules', external_calls: false, source_limits: AGENT_SOURCE_LIMITS, hook_limits: AGENT_HOOK_LIMITS,
           },
           tasks: { execution: 'synchronous', statuses: ['completed'], asynchronous_supported: false },
           limits: { request_bytes: REQUEST_LIMIT, raw_snapshot_bytes: RAW_LIMIT, devices: DEVICE_LIMIT, retained_results: RESULT_LIMIT },

@@ -776,7 +776,7 @@ ${pageReports[reportPage]}
             </button>}
           </div>
         </div>}
-        {page === "overview" && <HealthGuardPage device={localDevice} state={healthState} loading={snapshotLoading} loadError={snapshotError} onRefresh={refreshSnapshot} externalBusy={demoRunning} onBusyChange={onActionBusy} onNavigate={navItem => {
+        {page === "overview" && <HealthGuardPage device={localDevice} state={healthState} agentLive={!offlineDemo} loading={snapshotLoading} loadError={snapshotError} onRefresh={refreshSnapshot} externalBusy={demoRunning} onBusyChange={onActionBusy} onNavigate={navItem => {
           if (navItem === "gpu" || navItem === "agents") {
             setSelectedDeviceId(localDevice.id);
           }

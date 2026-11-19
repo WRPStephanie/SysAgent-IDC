@@ -24,6 +24,8 @@ export interface ResourceRankingsProps {
   onCleanupSessions: (agentId: string, sessionIds: string[]) => void;
   agentOnly: boolean;
   onAgentOnlyChange: (agentOnly: boolean) => void;
+  query: string;
+  onQueryChange: (query: string) => void;
 }
 export function formatPercent(value: number) {
   return `${Math.round(value * 10) / 10}%`;
@@ -145,7 +147,9 @@ export function ResourceRankings({
   busy,
   onCleanupSessions,
   agentOnly,
-  onAgentOnlyChange
+  onAgentOnlyChange,
+  query,
+  onQueryChange
 }: ResourceRankingsProps) {
   const agentRows = resource.rows.filter((row): row is AgentResourceRow => Boolean(row.agentId && row.sessions));
   const [expandedAgentIds, setExpandedAgentIds] = useState<string[]>(() => agentOnly && agentRows.length ? [agentRows[0].agentId] : []);
@@ -160,17 +164,31 @@ export function ResourceRankings({
     nextAgentOnly !== agentOnly && (onAgentOnlyChange(nextAgentOnly), nextAgentOnly && agentRows.length && setExpandedAgentIds([agentRows[0].agentId]));
   }
   if (collected) {
-    const rows = collectedRankingRows(resource, agentOnly);
+    const rows = collectedRankingRows(resource, agentOnly, query);
     const eligible = rows.filter(row => row.cleanable);
     const chosen = eligible.filter(row => selectedIds.includes(row.id));
     return <div className="sh-collected-rankings">
+      {resource.id === 'energy' && <>
+        <div className="sh-rank-table"><table aria-label="功率构成">
+          <thead><tr><th>组件</th><th>功率（W）</th><th>来源</th></tr></thead>
+          <tbody>{resource.rows.map(row => <tr key={row.id} data-component-id={row.id}>
+            <td><strong>{row.name}</strong></td><td><b>{formatRankingValue(resource, row)}</b></td><td>{row.detail}</td>
+          </tr>)}{resource.power?.missing.map(key => <tr key={`missing-${key}`}>
+            <td>{key.toUpperCase()}（未覆盖部分）</td><td>未知</td><td>不可用</td>
+          </tr>)}</tbody>
+        </table></div>
+        <p className="sh-muted">未归因 CPU 功率：{resource.power?.unattributedCpuWatts === null || resource.power?.unattributedCpuWatts === undefined ? '未知' : `${Number(resource.power.unattributedCpuWatts.toFixed(1))} W`}；未列出的进程与静态功率不强行分摊。</p>
+        <h3>进程 CPU 功率估算</h3>
+      </>}
       <div className="sh-rank-filter-row">
         <div className="sh-rank-filter" role="group" aria-label="排行筛选">
           <button aria-pressed={!agentOnly} disabled={busy} onClick={() => { onAgentOnlyChange(false); onSelect([]); }}>全部程序</button>
-          <button aria-pressed={agentOnly} disabled={busy} onClick={() => { onAgentOnlyChange(true); onSelect([]); }}><Bot size={13} />只看 Agent<span>{resource.rows.filter(row => row.agentKind).length}</span></button>
+          <button aria-pressed={agentOnly} disabled={busy} onClick={() => { onAgentOnlyChange(true); onSelect([]); }}><Bot size={13} />只看 Agent<span>{(resource.id === 'energy' ? resource.power?.processes ?? [] : resource.rows).filter(row => row.agentKind).length}</span></button>
         </div>
         <span>按常见进程名称白名单识别，可能漏识别；不推断 Session 归属。</span>
       </div>
+      <input className="sh-rank-search" type="search" aria-label="搜索进程名称或 PID" placeholder="搜索进程名称或 PID" value={query} disabled={busy}
+        onChange={event => { onQueryChange(event.target.value); onSelect([]); }} />
       <div className="sh-rank-toolbar">
         <label><input type="checkbox" aria-label="全选可结束进程" disabled={blocked || !eligible.length}
           checked={eligible.length > 0 && chosen.length === eligible.length}
@@ -194,7 +212,7 @@ export function ResourceRankings({
           <td><b>{formatRankingValue(resource, row)}</b></td>
           <td><span className={row.cleanable ? 'sh-cleanable' : 'sh-protected'}>{row.cleanable ? '可结束' : '受保护 / 不可用'}</span><small>{row.effect}</small></td>
         </tr>)}</tbody>
-      </table></div> : <p className="sh-empty">{agentOnly ? '本次采样未识别到白名单 Agent；不代表没有 Agent 运行。' : '本次采集范围内没有可用排行数据；不代表系统没有资源占用。'}</p>}
+      </table></div> : <p className="sh-empty">{query?.trim() ? '当前筛选没有匹配进程。' : resource.id === 'energy' && !resource.power?.processes.length ? '本次进程功率无法估算或没有可用进程样本，进程功率未知；不代表零能耗。' : agentOnly ? '本次采样未识别到白名单 Agent；不代表没有 Agent 运行。' : '本次采集范围内没有可用排行数据；不代表系统没有资源占用。'}</p>}
       <p className="sh-muted">仅允许结束当前用户的非受保护进程；不清理文件，不提供 Session 级操作。</p>
     </div>;
   }

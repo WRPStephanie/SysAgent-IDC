@@ -54,6 +54,16 @@ const sessionRow = (overrides = {}) => ({ session_id: 'session-1', conversation_
 const eventRow = (overrides = {}) => ({ interruption_id: 'event-1', session_id: null, call_id: null, pid: null, agent_name: null, interruption_type: 'tool_error', severity: 'low', occurred_at_ns: ns, resolved: false, ...overrides });
 const countRow = (total = 0, critical = 0, high = 0) => ({ total, by_severity: { critical, high, medium: 0, low: total - critical - high } });
 const latencyRow = (overrides = {}) => ({ agent_name: null, call_count: 0, streaming_call_count: 0, ttft_ms: null, tps_tokens_per_second: null, tpot_ms_per_token: null, e2e_latency_ms: null, ...overrides });
+const hookRow = (index = 0, overrides = {}) => ({
+  event_id: index.toString(16).padStart(16, '0'), agent: 'qoder', kind: 'prompt_submit',
+  occurred_at: new Date(ms - index).toISOString(), session_id: 'hook/session:1',
+  tool: null, call_id: null, error_type: null, interrupt: null, subagent: null, model: null, ...overrides,
+});
+function hookPayload(events = [hookRow()], status = 'available', skipped_lines = 0, reason = '') {
+  const body = payload();
+  body.raw_snapshot.hooks = source({ events, skipped_lines }, status, reason);
+  return body;
+}
 function payload() {
   return {
     schema_version: '1.0', request_id: crypto.randomUUID(), device_id: crypto.randomUUID(),
@@ -91,6 +101,7 @@ function matches(schema, value, at = '$') {
     if (schema.maxLength !== undefined) assert([...value].length <= schema.maxLength, at);
     if (schema.pattern) assert(new RegExp(schema.pattern).test(value), `${at}: pattern`);
     if (schema.format === 'date-time') assert(Number.isFinite(Date.parse(value)), at);
+    if (schema === spec.components.schemas.AgentHookDateTime) assert.equal(new Date(value).toISOString(), value, `${at}: strict calendar milliseconds Z`);
     if (schema.format === 'uuid') assert.match(value, new RegExp(spec.components.schemas.UUID.pattern));
   }
   if (typeof value === 'number') {
@@ -172,7 +183,143 @@ async function withServer(run) {
 }
 const coverage = (report, key) => report.coverage.find(item => item.key === key);
 
-test('real modules type-check against the unchanged shared AgentDiagnostic interface without emission', () => {
+function historyPayload() {
+  const body = payload();
+  body.raw_snapshot.history = { scope: 'all_stored', sampled_at: sampledAt, sources: {
+    usage: source({ calls: 9001, inputTokens: 12002, outputTokens: 13003 }),
+    sessions: source({ total: 1501 }), interruptionCounts: source(countRow(800, 300, 400)),
+  } };
+  return body;
+}
+const historyCoverage = (report, key) => report.history.coverage.find(item => item.key === key);
+function assertCurrentUnchanged(report, baseline = parse()) {
+  const current = structuredClone(report); delete current.history;
+  assert.deepEqual(current, baseline, 'Historical evidence must not affect 24h totals, health, findings, summary or coverage');
+}
+
+test('AgentSight all_stored history isolated parser: optional history interprets only retained-history aggregates', () => {
+  const baseline = parse();
+  assert.equal(Object.hasOwn(baseline, 'history'), false, 'Missing raw history adds no evidence');
+  const body = historyPayload();
+  matches(spec.components.schemas.AgentRawSnapshot, body.raw_snapshot);
+  const report = parse(body);
+  assert.deepEqual(report.history, {
+    scope: 'all_stored', sampledAt, status: 'ok',
+    coverage: ['usage', 'sessions', 'interruptionCounts'].map(key => ({ key, status: 'available', reason: '' })),
+    totals: { sessions: 1501, calls: 9001, inputTokens: 12002, outputTokens: 13003, unresolved: 800, critical: 300, high: 400 },
+  });
+  assertCurrentUnchanged(report, baseline);
+  const unavailable = historyPayload(); unavailable.raw_snapshot.sources = {};
+  const unavailableBaseline = payload(); unavailableBaseline.raw_snapshot.sources = {};
+  const historyOnly = parse(unavailable);
+  assert.equal(historyOnly.history.status, 'ok');
+  assert.equal(historyOnly.status, 'unavailable'); assert.equal(historyOnly.outcome, 'unknown');
+  assertCurrentUnchanged(historyOnly, parse(unavailableBaseline));
+  const older = historyPayload(); older.raw_snapshot.history.sampled_at = '2026-10-01T00:00:00.000Z';
+  assert.equal(parse(older).history.sampledAt, older.raw_snapshot.history.sampled_at);
+});
+
+test('AgentSight all_stored history isolated parser: independent failures null only that aggregate, never fall back to 24h', () => {
+  const baseline = parse();
+  const totalsByKey = { usage: ['calls', 'inputTokens', 'outputTokens'], sessions: ['sessions'], interruptionCounts: ['unresolved', 'critical', 'high'] };
+  for (const key of Object.keys(totalsByKey)) {
+    for (const status of ['unavailable', 'invalid', 'truncated']) {
+      const body = historyPayload();
+      const sources = body.raw_snapshot.history.sources;
+      sources[key] = source(status === 'truncated' ? sources[key].data : null, status, 'not complete');
+      const report = parse(body);
+      assert.equal(report.history.status, 'partial');
+      assert.equal(historyCoverage(report, key).status, status);
+      for (const [other, names] of Object.entries(totalsByKey)) for (const name of names) {
+        assert.equal(report.history.totals[name] === null, other === key, `${key} failure: ${name}`);
+      }
+      assertCurrentUnchanged(report, baseline);
+    }
+  }
+  const failed = historyPayload();
+  for (const key of Object.keys(failed.raw_snapshot.history.sources)) failed.raw_snapshot.history.sources[key] = source(null, 'unavailable', 'unsupported revision');
+  const report = parse(failed);
+  assert.equal(report.history.status, 'unavailable');
+  assert(Object.values(report.history.totals).every(value => value === null));
+  assertCurrentUnchanged(report, baseline);
+  const empty = historyPayload();
+  empty.raw_snapshot.history.sources = { usage: source({ calls: 0, inputTokens: 0, outputTokens: 0 }), sessions: source({ total: 0 }), interruptionCounts: source(countRow()) };
+  assert.equal(parse(empty).history.status, 'ok');
+  assert(Object.values(parse(empty).history.totals).every(value => value === 0));
+});
+
+test('AgentSight all_stored history isolated parser: strict aggregate whitelist, statuses, timestamps and safe counts', () => {
+  const baseline = parse();
+  const invalidHistory = [null, [], 'private-history', {},
+    { ...historyPayload().raw_snapshot.history, scope: 'lifetime' },
+    { ...historyPayload().raw_snapshot.history, scope: 'cumulative' },
+    { ...historyPayload().raw_snapshot.history, sampled_at: '2026-02-30T12:00:00Z' },
+    { ...historyPayload().raw_snapshot.history, sampled_at: '2026-11-11T24:00:00Z' },
+    { ...historyPayload().raw_snapshot.history, sampled_at: '2026-11-11T12:00:00' },
+    { ...historyPayload().raw_snapshot.history, sampled_at: '2026-11-12T12:00:00.000Z' },
+    { ...historyPayload().raw_snapshot.history, sampled_at: Infinity },
+    { ...historyPayload().raw_snapshot.history, private: 'private-history' },
+    { ...historyPayload().raw_snapshot.history, sources: [] },
+    { ...historyPayload().raw_snapshot.history, sources: { ...historyPayload().raw_snapshot.history.sources, other: source({ total: 0 }) } },
+  ];
+  for (const history of invalidHistory) {
+    const body = payload(); body.raw_snapshot.history = history;
+    const report = parse(body);
+    assert.equal(report.history.status, 'unavailable');
+    assert(report.history.coverage.every(row => row.status === 'invalid'));
+    assert(Object.values(report.history.totals).every(value => value === null));
+    assert.doesNotMatch(JSON.stringify(report), /private-history/);
+    assertCurrentUnchanged(report, baseline);
+  }
+  for (const key of ['usage', 'sessions', 'interruptionCounts']) {
+    const malformed = [null, [], {}, source(null), source({}, 'healthy'), source({}, 'unavailable'),
+      source(null, 'invalid', 'x'.repeat(513)), { status: 'available', data: {} },
+      { ...source({}), raw: 'private-history' }];
+    for (const invalidSource of malformed) {
+      const body = historyPayload(); body.raw_snapshot.history.sources[key] = invalidSource;
+      const report = parse(body);
+      assert.equal(historyCoverage(report, key).status, 'invalid');
+      assert.equal(report.history.status, 'partial');
+      assertCurrentUnchanged(report, baseline);
+    }
+  }
+  for (const bad of [NaN, Infinity, -Infinity, -1, 1.5, '0', null, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const name of ['calls', 'inputTokens', 'outputTokens']) {
+      const body = historyPayload(); body.raw_snapshot.history.sources.usage.data[name] = bad;
+      const report = parse(body);
+      assert.equal(historyCoverage(report, 'usage').status, 'invalid');
+      assert.deepEqual([report.history.totals.calls, report.history.totals.inputTokens, report.history.totals.outputTokens], [null, null, null]);
+      assertCurrentUnchanged(report, baseline);
+    }
+    const body = historyPayload(); body.raw_snapshot.history.sources.sessions.data.total = bad;
+    assert.equal(historyCoverage(parse(body), 'sessions').status, 'invalid');
+  }
+  for (const [key, data] of [
+    ['usage', { calls: 1, inputTokens: 2, outputTokens: 3, cacheTokens: 4 }],
+    ['usage', { calls: 1, inputTokens: 2 }], ['sessions', { total: 1, rows: [] }], ['sessions', []],
+    ['interruptionCounts', { ...countRow(), extra: 0 }],
+    ['interruptionCounts', { total: 0, by_severity: { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 } }],
+    ['interruptionCounts', countRow(5, 4, 3)],
+    ['interruptionCounts', { total: Number.MAX_SAFE_INTEGER, by_severity: { critical: Number.MAX_SAFE_INTEGER, high: 1, medium: 0, low: 0 } }],
+  ]) {
+    const body = historyPayload(); body.raw_snapshot.history.sources[key].data = data;
+    const report = parse(body);
+    assert.equal(historyCoverage(report, key).status, 'invalid');
+    assertCurrentUnchanged(report, baseline);
+  }
+  const boundary = historyPayload();
+  boundary.raw_snapshot.history.sources.usage.data = { calls: Number.MAX_SAFE_INTEGER, inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 0 };
+  boundary.raw_snapshot.history.sources.sessions.data = { total: Number.MAX_SAFE_INTEGER };
+  assert.equal(parse(boundary).history.status, 'ok');
+  const safe = historyPayload(); safe.raw_snapshot.history.sources.usage.reason = '<tag>&\n\u202e';
+  assert.doesNotMatch(historyCoverage(parse(safe), 'usage').reason, /[<>&\n\u202e]/);
+  safe.raw_snapshot.history.sources.usage.status = 'truncated';
+  safe.raw_snapshot.history.sources.usage.reason = 'x'.repeat(512);
+  assert.equal(historyCoverage(parse(safe), 'usage').reason.length, 512);
+  assert.equal(forbiddenCalls, 0);
+});
+
+test('real modules type-check against the shared AgentDiagnostic with required hooks without emission', () => {
   const program = ts.createProgram([path.join(root, 'agent-diagnostics.ts'), path.join(root, 'openapi-service.ts')], {
     target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, strict: true, noEmit: true,
     resolveJsonModule: true, esModuleInterop: true, skipLibCheck: true, types: ['node'],
@@ -207,6 +354,7 @@ test('contract references resolve, independent capability is explicit and authen
     requires_sysak_snapshot: false, requires_revision: false, mutates_sysak_snapshot: false,
     analyzer: 'local-rules', external_calls: false,
     source_limits: { processes: 256, sessions: 500, interruptions: 200, interruptionCounts: 1, latency: 256 },
+    hook_limits: { events: 5000, recent: 200, agents: 16 },
   });
   assert.deepEqual((await exchange(api, '/openapi/v1/openapi.json')).json, spec);
 }));
@@ -224,6 +372,189 @@ test('latency contract is an array of strict agent-group rows bounded at 256', (
   assert.throws(() => matches(schema, latencyRow()));
   assert.throws(() => matches(schema, Array.from({ length: 257 }, (_, i) => latencyRow({ agent_name: `agent-${i}` }))));
   assert.throws(() => matches(schema, [latencyRow({ extra: 'private-field' })]));
+});
+
+test('Hook contract declares strict metadata schemas, independent optional raw input and required bounded report', () => {
+  const schemas = spec.components.schemas;
+  assert.equal(schemas.AgentRawSnapshot.required.includes('hooks'), false);
+  assert.equal(schemas.AgentRawSnapshot.properties.hooks['x-valid-data-schema'], '#/components/schemas/AgentRawHooks');
+  assert.match(schemas.AgentRawSnapshot.properties.hooks.description, /200.*hooks.invalid/);
+  assert.equal(schemas.AgentRawSnapshot.properties.sources.properties.hooks, undefined);
+  assert.ok(schemas.AgentDiagnostic.required.includes('hooks'));
+  assert.equal(schemas.AgentDiagnostic.properties.coverage.minItems, 5);
+  assert.equal(schemas.AgentDiagnostic.properties.coverage.maxItems, 5);
+  assert.equal(schemas.AgentDiagnostic.properties.findings.maxItems, 527);
+  assert.equal(schemas.AgentRawHooks.properties.events.maxItems, 5000);
+  assert.equal(schemas.AgentHookReport.properties.events.maxItems, 200);
+  assert.equal(schemas.AgentHookReport.properties.agents.maxItems, 16);
+  const { agentHookKindLabels } = load(path.join(root, 'src/agent-diagnostics-data.ts'));
+  assert.deepEqual(schemas.AgentHookKind.enum, Object.keys(agentHookKindLabels));
+  matches(schemas.AgentRawHooks, { events: [hookRow()], skipped_lines: 0 });
+  for (const key of ['AgentRawHookSource', 'AgentRawHooks', 'AgentRawHookEvent', 'AgentHookEvent', 'AgentHookAgentSummary', 'AgentHookReport']) {
+    assert.equal(schemas[key].additionalProperties, false, key);
+    const properties = Object.keys(schemas[key].properties);
+    assert.deepEqual(new Set(schemas[key].required), new Set(properties.filter(name => name !== 'history')), key);
+    if (properties.includes('history')) assert.deepEqual(schemas[key].properties.history, { $ref: '#/components/schemas/AgentHookHistory' }, key);
+  }
+  const invalid = [
+    { event_id: '0123456789ABCDEF' }, { event_id: '0123456789abcde' }, { agent: 'Qoder' }, { agent: '-qoder' }, { agent: 'a'.repeat(33) },
+    { kind: 'PreToolUse' }, { occurred_at: '2026-11-11T12:00:00Z' }, { occurred_at: '2026-11-11T12:00:00.123+00:00' },
+    { occurred_at: '2026-02-30T12:00:00.123Z' }, { session_id: '' }, { session_id: 'a'.repeat(129) },
+    { tool: 'read file' }, { call_id: 'call\n1' }, { error_type: '<private>' }, { subagent: 'sub\nagent' }, { model: 'model\tv1' },
+    { interrupt: 'false' }, { raw: 'secret' },
+  ];
+  invalid.forEach(overrides => assert.throws(() => matches(schemas.AgentRawHookEvent, hookRow(0, overrides))));
+  for (const value of [null, 'Aa0._:@/+-']) matches(schemas.AgentHookIdentifier, value);
+  for (const value of [null, 'code reviewer', 'model v1._:@/+-']) matches(schemas.AgentHookLabel, value);
+  assert.throws(() => matches(schemas.AgentRawHooks, { events: [], skipped_lines: -1 }));
+  assert.throws(() => matches(schemas.AgentRawHooks, { events: Array.from({ length: 5001 }, (_, i) => hookRow(i)), skipped_lines: 0 }));
+  const report = parse();
+  delete report.hooks;
+  assert.throws(() => matches(schemas.AgentDiagnostic, report));
+});
+
+test('HTTP absent/empty/unavailable/invalid/truncated Hooks preserve independent AgentSight status and five sources', async () => withServer(async api => {
+  const baseline = (await accepted(api)).report;
+  assert.deepEqual(baseline.hooks, { status: 'unavailable', reason: '未采集 Agent Hook 元数据。', skippedLines: null, agents: [], events: [] });
+  for (const status of ['available', 'unavailable', 'invalid', 'truncated']) {
+    const body = payload();
+    body.raw_snapshot.hooks = source(status === 'available' || status === 'truncated' ? { events: [], skipped_lines: 0 } : null, status, 'metadata only');
+    const report = (await accepted(api, body)).report;
+    assert.deepEqual(report.hooks, { status, reason: 'metadata only', skippedLines: status === 'available' || status === 'truncated' ? 0 : null, agents: [], events: [] });
+    assert.equal(report.status, baseline.status);
+    assert.equal(report.outcome, baseline.outcome);
+    assert.deepEqual(report.coverage, baseline.coverage);
+    assert.equal(report.coverage.length, 5);
+    assert.deepEqual(report.totals, baseline.totals);
+  }
+  const wrongPlace = payload(); wrongPlace.raw_snapshot.sources.hooks = source({ events: [], skipped_lines: 0 });
+  await rejected(api, wrongPlace); // Unknown sources keys still fail the envelope.
+}));
+
+test('HTTP Hook summaries pair tools by session/call and keep cancellations, denials and open starts non-fault observations', async () => withServer(async api => {
+  const entries = [
+    ['prompt_submit', 's/1', null, null], ['tool_start', 's/1', 'call:1', null], ['tool_end', 's/1', 'call:1', null],
+    ['tool_start', 's/1', 'call:1', null], ['tool_failure', 's/1', 'call:1', true], ['tool_failure', 's/1', null, null],
+    ['permission_denied', 's/1', null, null], ['turn_stop', 's/1', null, null], ['tool_start', 's/2', 'call:1', null],
+    ['tool_end', 's/1', 'call:1', false], ['tool_start', null, 'call:2', null],
+  ];
+  const events = entries.map(([kind, session_id, call_id, interrupt], i) => hookRow(i, {
+    kind, session_id, call_id, interrupt, occurred_at: new Date(ms - (entries.length - 1 - i)).toISOString(),
+    tool: kind.startsWith('tool_') ? 'read_file' : null, error_type: kind === 'tool_failure' ? 'cancelled' : null,
+    subagent: 'code reviewer', model: 'model v1',
+  })).reverse(); // Input order is not chronological.
+  const { report } = await accepted(api, hookPayload(events, 'available', 7));
+  assert.equal(report.status, 'ok');
+  assert.equal(report.outcome, 'observed');
+  assert.equal(report.hooks.skippedLines, 7);
+  assert.deepEqual(report.hooks.agents, [{ agent: 'qoder', sessions: 2, events: 11, prompts: 1, toolStarts: 4, toolEnds: 2, toolFailures: 1, interrupts: 1, permissionDenied: 1, turnFailures: 0, openTools: 1, lastEventAt: sampledAt }]);
+  assert.deepEqual(report.hooks.events.map(row => row.id), events.map(row => row.event_id));
+  for (const row of report.hooks.events) assert.deepEqual(Object.keys(row), ['id', 'agent', 'kind', 'occurredAt', 'sessionId', 'tool', 'callId', 'errorType', 'interrupt', 'subagent', 'model']);
+  assert.equal(report.findings.filter(row => row.title.startsWith('qoder')).length, 3);
+  assert(report.findings.every(row => row.severity === 'info'));
+  const noSight = hookPayload([hookRow(0, { kind: 'turn_failure' })]);
+  noSight.raw_snapshot.sources = {};
+  const failure = (await accepted(api, noSight)).report;
+  assert.equal(failure.status, 'unavailable');
+  assert.equal(failure.outcome, 'abnormal');
+  assert.equal(failure.hooks.status, 'available');
+  assert.equal(failure.hooks.agents[0].turnFailures, 1);
+  assert.equal(failure.coverage.length, 5);
+  assert.match(failure.findings.find(row => row.title.includes('轮次失败')).detail, /原因未知/);
+}));
+
+test('HTTP Hook bounds accept 5000 events/16 agents, count the full input and return only latest 200', async () => withServer(async api => {
+  const events = Array.from({ length: 5000 }, (_, i) => hookRow(i, { agent: `agent-${i % 16}` })).reverse();
+  matches(spec.components.schemas.AgentRawHooks, { events, skipped_lines: 0 });
+  const report = (await accepted(api, hookPayload(events))).report;
+  assert.equal(report.status, 'ok');
+  assert.equal(report.hooks.status, 'available');
+  assert.equal(report.hooks.events.length, 200);
+  assert.deepEqual(report.hooks.events.map(row => row.id), Array.from({ length: 200 }, (_, i) => hookRow(i).event_id));
+  assert.equal(report.hooks.agents.length, 16);
+  assert.equal(report.hooks.agents.reduce((sum, agent) => sum + agent.events, 0), 5000);
+  assert.deepEqual(report.hooks.agents.map(row => row.agent), [...new Set(events.map(row => row.agent))].sort((a, b) => a.localeCompare(b)));
+  assert(report.hooks.agents.every(row => row.sessions === 1 && row.prompts === row.events));
+  const truncated = (await accepted(api, hookPayload(events, 'truncated', 12, 'collector bounded'))).report;
+  assert.equal(truncated.hooks.status, 'truncated');
+  assert.equal(truncated.hooks.skippedLines, 12);
+  assert.equal(truncated.status, 'ok');
+  assert.deepEqual(truncated.coverage, report.coverage);
+  assert.equal(truncated.hooks.events.length, 200);
+  for (const rows of [[...events, hookRow(5000)], Array.from({ length: 17 }, (_, i) => hookRow(i, { agent: `agent-${i}` }))]) {
+    const invalid = (await accepted(api, hookPayload(rows))).report;
+    assert.equal(invalid.hooks.status, 'invalid');
+    assert.equal(invalid.hooks.skippedLines, null);
+    assert.deepEqual(invalid.hooks.agents, []);
+    assert.deepEqual(invalid.hooks.events, []);
+    assert.equal(invalid.status, 'ok');
+    assert.deepEqual(invalid.coverage, report.coverage);
+  }
+}));
+
+test('HTTP malformed Hook sources and any invalid row fail closed at 200 without leaking raw fields', async () => withServer(async api => {
+  const malformed = [null, [], 'raw-secret', {}, source([], 'available'), source(null, 'available'), source({ events: [], skipped_lines: 0 }, 'unavailable'),
+    source(null, 'healthy'), source(null, 'invalid', 'x'.repeat(513)), { status: 'available', data: { events: [], skipped_lines: 0 } },
+    { ...source({ events: [], skipped_lines: 0 }), raw: 'raw-secret' },
+    source({ events: [], skipped_lines: -1 }), source({ events: [], skipped_lines: 1.5 }), source({ events: [], skipped_lines: Number.MAX_SAFE_INTEGER + 1 }),
+    source({ events: [], skipped_lines: 0, prompt: 'raw-secret' }), source({ events: [hookRow(), hookRow()], skipped_lines: 0 }),
+  ];
+  const rowInvalidators = [
+    row => { row.event_id = '0123456789ABCDEF'; }, row => { row.agent = 'Qoder'; }, row => { row.kind = 'PreToolUse'; },
+    row => { row.occurred_at = '2026-02-30T12:00:00.123Z'; }, row => { row.occurred_at = '2026-11-11T12:00:00Z'; },
+    row => { row.occurred_at = '2026-11-11T12:00:00.123+00:00'; }, row => { row.occurred_at = new Date(ms + 1).toISOString(); },
+    row => { row.occurred_at = new Date(ms - 24 * 3600 * 1000 - 1).toISOString(); },
+    row => { row.session_id = ''; }, row => { row.tool = 'read file'; }, row => { row.call_id = 'call\n1'; },
+    row => { row.error_type = '<raw-secret>'; }, row => { row.model = 'bad\nmodel'; }, row => { row.subagent = 'a'.repeat(129); },
+    row => { row.interrupt = 'false'; }, row => { delete row.model; },
+    ...['prompt', 'tool_input', 'tool_output', 'error_body', 'command', 'path', 'raw', 'input_tokens'].map(key => row => { row[key] = 'raw-secret'; }),
+  ];
+  for (const invalidate of rowInvalidators) {
+    const row = hookRow(1); invalidate(row);
+    malformed.push(source({ events: [hookRow(), row], skipped_lines: 0 }));
+  }
+  for (const hooks of malformed) {
+    const body = payload(); body.raw_snapshot.hooks = hooks;
+    const report = (await accepted(api, body)).report;
+    assert.equal(report.hooks.status, 'invalid');
+    assert.deepEqual(report.hooks.events, []);
+    assert.deepEqual(report.hooks.agents, []);
+    assert.equal(report.hooks.skippedLines, null);
+    assert.equal(report.status, 'ok');
+    assert.equal(report.outcome, 'observed');
+    assert.equal(report.coverage.length, 5);
+    assert(report.coverage.every(row => row.status === 'available'));
+    assert.doesNotMatch(JSON.stringify(report), /raw-secret/);
+  }
+  for (const badTail of [null, hookRow(0), hookRow(4999, { prompt: 'raw-secret' })]) {
+    const events = Array.from({ length: 4999 }, (_, i) => hookRow(i)); events.push(badTail);
+    const report = (await accepted(api, hookPayload(events))).report;
+    assert.equal(report.hooks.status, 'invalid', 'Invalid rows beyond recent 200 are not silently discarded');
+    assert.deepEqual(report.hooks.events, []);
+  }
+  const boundary = hookPayload([hookRow(0, { occurred_at: payload().raw_snapshot.window.start }), hookRow(1, { occurred_at: sampledAt })]);
+  assert.equal((await accepted(api, boundary)).report.hooks.status, 'available');
+  const safeReason = (await accepted(api, hookPayload([], 'available', 0, '<tag>&\n\u202e'))).report.hooks.reason;
+  assert.doesNotMatch(safeReason, /[<>&\n\u202e]/);
+}));
+
+test('Hook report schemas enforce required fields, whitelist, safe counts and 200/16/527 bounds', () => {
+  const report = parse(hookPayload());
+  const invalidators = [
+    body => { delete body.hooks; }, body => { body.hooks.raw = {}; }, body => { body.hooks.skippedLines = -1; },
+    body => { body.hooks.events[0].raw = {}; }, body => { delete body.hooks.events[0].interrupt; },
+    body => { body.hooks.agents[0].events = 5001; }, body => { body.hooks.agents[0].openTools = -1; },
+    body => { body.hooks.events = Array.from({ length: 201 }, () => body.hooks.events[0]); },
+    body => { body.hooks.agents = Array.from({ length: 17 }, () => body.hooks.agents[0]); },
+    body => { body.coverage.push({ key: 'hooks', status: 'available', reason: '' }); },
+    body => { body.findings = Array.from({ length: 528 }, () => ({ severity: 'info', title: '', detail: '', suggestion: '' })); },
+  ];
+  for (const invalidate of invalidators) {
+    const invalid = structuredClone(report); invalidate(invalid);
+    assert.throws(() => matches(spec.components.schemas.AgentDiagnostic, invalid));
+  }
+  report.findings = Array.from({ length: 527 }, () => ({ severity: 'info', title: '', detail: '', suggestion: '' }));
+  matches(spec.components.schemas.AgentDiagnostic, report);
 });
 
 test('Bearer, Origin, POST-only, media and compression restrictions apply before evidence parsing', async () => withServer(async api => {
@@ -622,13 +953,41 @@ test('real parsing performs no external HTTP, LLM/fetch, shell, restart or proce
   for (const [owner, key] of changes) owner[key] = forbidden;
   try {
     await withServer(async api => {
-      const body = payload();
+      const body = hookPayload([
+        hookRow(0, { kind: 'turn_failure' }), hookRow(1, { kind: 'permission_denied' }),
+        hookRow(2, { kind: 'tool_failure', interrupt: true }),
+      ]);
       body.raw_snapshot.sources.processes.data.agents[0] = processRow({ status: 'offline', has_crash: true });
       body.raw_snapshot.sources.interruptions = source([eventRow({ interruption_type: 'llm_error', severity: 'critical' })]);
       body.raw_snapshot.sources.interruptionCounts = source(countRow(1, 1));
       const result = await accepted(api, body);
       assert.equal(result.report.outcome, 'abnormal');
+      assert.equal(result.report.hooks.status, 'available');
+      const { queryDataset, datasetCatalog } = require('../electron/query-data.cjs');
+      const view = { state: null, agent: structuredClone(result.report), tasks: [], status: { enabled: false } };
+      const before = structuredClone(view);
+      function freeze(value) {
+        if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
+      }
+      freeze(view);
+      for (const name of ['agent-hook-events', 'agent-hook-agents']) {
+        const query = queryDataset(view, name, new URLSearchParams('sort=-agent&fields=id,agent'));
+        assert.equal(query.meta.source, 'agent-hooks');
+        assert.equal(query.meta.status, 'available');
+        assert.equal(query.meta.revision, null);
+        assert.equal(query.meta.coverage.sources, undefined);
+        assert.deepEqual(query.meta.coverage.window, result.report.window);
+        assert.ok(query.items.length);
+        const detail = queryDataset(view, name, new URLSearchParams(), query.items[0].id);
+        assert.equal(detail.item.agent, 'qoder');
+        detail.item.agent = 'changed';
+        query.meta.coverage.reason = 'changed';
+        assert.deepEqual(view, before);
+      }
+      assert.equal(datasetCatalog(view).datasets.length, 17);
+      assert.deepEqual(view, before);
       assert.deepEqual(await accepted(api, body), result);
+      assert.equal((await exchange(api, `/openapi/v1/devices/${body.device_id}/snapshot`)).status, 404);
       assert.equal((await exchange(api, `/openapi/v1/tasks/${result.task_id}`)).status, 200);
       await rejected(api, { ...payload(), command: 'restart; resolve; kill' });
       assert.equal(forbiddenCalls, 0);

@@ -1,0 +1,148 @@
+{
+  "description": "SysAgent管家（Qoder IDE）：仅注册 IDE 支持的事件，使用 IDE 文档化的 shell 形式 command + 显式 timeout + 单条 async；启动失败也以 0 退出，绝不阻断 Agent",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide SessionStart || true",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide SessionEnd || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide UserPromptSubmit || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide PreToolUse || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide PostToolUse || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide PostToolUseFailure || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide PermissionRequest || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide Stop || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide SubagentStart || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide SubagentStop || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide PreCompact || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${QODER_PLUGIN_ROOT}/bin/sysagent_hook.py\" qoder-ide Notification || true",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

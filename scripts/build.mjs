@@ -4,11 +4,12 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildQoder, QODER_VARIANTS, writeQoder } from './package-qoder.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const legalFiles = ['LICENSE', 'THIRD_PARTY_NOTICES', 'FONT_LICENSE'];
-const targets = ['all', 'desktop', 'ide', 'web'];
+const targets = ['all', 'desktop', 'ide', 'web', 'qoder'];
 
 export function parseArgs(args) {
   const options = { target: 'all', skipInstall: false, help: false };
@@ -50,28 +51,55 @@ function npm(folder, args) {
   else run('npm', args, cwd);
 }
 
+function checksums(output, artifacts, preserve = false) {
+  const file = resolve(output, 'SHA256SUMS');
+  const entries = new Map();
+  if (preserve && existsSync(file)) {
+    for (const line of readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
+      const match = /^([a-f0-9]{64})  (.+)$/.exec(line);
+      if (!match) throw new Error('已有 SHA256SUMS 格式无效；未覆盖校验清单');
+      entries.set(match[2], match[1]);
+    }
+  }
+  for (const name of artifacts) entries.set(name, createHash('sha256').update(readFileSync(resolve(output, name))).digest('hex'));
+  writeFileSync(file, [...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([name, digest]) => `${digest}  ${name}\n`).join(''));
+}
+
 export async function main(args = process.argv.slice(2)) {
   const options = parseArgs(args);
   if (options.help) {
     console.log(`用法：npm run build -- [选项]
 
-  --target all|desktop|ide|web  默认 all：主 deb、GX deb、AgentSight runtime deb、VSIX
-  --skip-install              复用已安装的依赖；首次构建不要使用
-  --help, -h                  显示帮助
+  --target all|desktop|ide|web|qoder  默认 all：三个 deb、VSIX、Qoder 与 Qoder IDE Hook ZIP
+  --skip-install                    复用已安装的依赖；首次原生/web 构建不要使用
+  --help, -h                        显示帮助
 
-Linux x64、Node.js 20+，原生构建输入已随源码提供。
+Node.js 20+；原生构建需要 Linux x64，构建输入已随源码提供。
 桌面打包需要 dpkg-deb；首次安装依赖需要联网，运行应用另需图形库。
+qoder 仅静态打两个 Hook ZIP（Qoder / Qoder IDE）：不安装依赖、不准备 SysAK、不构建前端；运行插件需 Linux python3>=3.6。
 产物：release/build-<版本>/；web：sysagent-idc/dist/。
-不会安装系统服务、开启采集、结束进程或上传发布件。`);
+不会安装系统服务或插件、开启采集、结束进程或上传发布件。`);
     return;
   }
   if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('需要 Node.js 20 或更高版本');
-  const native = options.target !== 'web';
+  const native = ['all', 'desktop', 'ide'].includes(options.target);
   const desktop = ['all', 'desktop'].includes(options.target);
   const ide = ['all', 'ide'].includes(options.target);
-  if (native && (process.platform !== 'linux' || process.arch !== 'x64')) throw new Error('原生构建仅支持 Linux x64；其他环境可使用 --target web');
+  if (native && (process.platform !== 'linux' || process.arch !== 'x64')) throw new Error('原生构建仅支持 Linux x64；其他环境可使用 --target web 或 qoder');
   run(process.execPath, [resolve(root, 'scripts/sync-versions.mjs'), '--check']);
   const { version } = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+  // Build and validate every Hook ZIP before writing one, so a bad variant never leaves a partial set behind.
+  const packageHooks = output => Object.keys(QODER_VARIANTS).map(variant => buildQoder({ root, version, variant }))
+    .map(archive => writeQoder(output, archive));
+  if (options.target === 'qoder') {
+    const output = resolve(root, `release/build-${version}`);
+    const filenames = packageHooks(output);
+    // A standalone ZIP build must not discard an existing deb/VSIX batch's checksums.
+    checksums(output, filenames, true);
+    for (const filename of filenames) console.log(`\n[build] 产物：${resolve(output, filename)}`);
+    console.log('\n[build] qoder 构建完成；未安装服务或插件、未上传文件');
+    return;
+  }
   const folders = ide ? ['sysagent-idc', 'sysagent-ide-extension'] : ['sysagent-idc'];
   if (options.skipInstall) {
     for (const folder of folders) {
@@ -141,11 +169,12 @@ Linux x64、Node.js 20+，原生构建输入已随源码提供。
       copyFileSync(resolve(root, 'sysagent-ide-extension/release', filename), resolve(output, filename));
       artifacts.push(filename);
     }
+    if (options.target === 'all') artifacts.push(...packageHooks(output));
     for (const file of legalFiles) {
       copyFileSync(resolve(root, file), resolve(output, file));
       artifacts.push(file);
     }
-    writeFileSync(resolve(output, 'SHA256SUMS'), artifacts.sort().map(file => `${createHash('sha256').update(readFileSync(resolve(output, file))).digest('hex')}  ${file}\n`).join(''));
+    checksums(output, artifacts, options.target !== 'all');
     console.log(`\n[build] 产物：release/build-${version}/`);
   }
   console.log(`\n[build] ${options.target} 构建完成；未安装服务或上传文件`);
